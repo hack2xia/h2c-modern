@@ -1,1 +1,2 @@
-curl --header 'User-Agent:' --header 'Accept:' --header 'Content-Type: application/x-www-form-urlencoded' --data-binary 'user=alice&pass=secret' 'https://example.com/login'
+curl --header 'User-Agent:' --header 'Accept:' --header 'Content-Type: application/x-www-form-urlencoded' --data-binary 'user=alice&pass=secret
+' 'https://example.com/login'

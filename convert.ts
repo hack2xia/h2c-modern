@@ -329,6 +329,33 @@ export function convert(httpText: string, options: Options = {}): ConvertResult 
       );
     }
   }
+  // 单个 Content-Length：与 body 实际字节数比对。
+  // 不一致时 curl 会按实际长度重算、静默改变线上字节，属"可能有问题"，应提醒；
+  // 声明长度大于实际时，多半是粘贴/日志截断，提示更明确。
+  if (clValues.length === 1) {
+    const cl = clValues[0].trim();
+    if (!/^\d+$/.test(cl)) {
+      warnings.push(
+        `Content-Length 值 "${cl}" 不是合法数字，已忽略（curl 会自动按 body 实际字节数计算）`,
+      );
+    } else {
+      const actual = new TextEncoder().encode(req.body).length;
+      const declared = Number(cl);
+      if (declared !== actual) {
+        if (actual < declared) {
+          warnings.push(
+            `Content-Length 声明 ${declared} 字节，但 body 实际只有 ${actual} 字节` +
+              `——请求体可能被截断，请检查原始请求是否完整（curl 将按实际长度发送）`,
+          );
+        } else {
+          warnings.push(
+            `Content-Length 声明 ${declared} 字节，但 body 实际为 ${actual} 字节` +
+              `——不一致，curl 将按实际长度发送`,
+          );
+        }
+      }
+    }
+  }
 
   // chunked Transfer-Encoding 是流式语义，curl 命令行无法忠实表达：
   // 服务端可能依赖分块边界（如流式上传/大 body），且命令行长度受限。

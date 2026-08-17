@@ -656,3 +656,55 @@ Deno.test('url: absolute-form 含 {} 同样追加 --globoff', () => {
   );
   assertEquals(result.warnings.length, 2);
 });
+
+// ===== Content-Length 与 body 实际字节数：curl 会重算，不一致应提醒 =====
+
+Deno.test('warn: Content-Length 大于 body 字节数（可能截断）', () => {
+  const result = convert(
+    'POST /api HTTP/1.1\nHost: example.com\nContent-Length: 100\n\nhello world',
+  );
+  assertEquals(result.warnings.length, 1);
+  if (!/Content-Length/.test(result.warnings[0]) || !/截断/.test(result.warnings[0])) {
+    throw new Error(`unexpected warning: ${result.warnings[0]}`);
+  }
+});
+
+Deno.test('warn: Content-Length 小于 body 字节数', () => {
+  const result = convert(
+    'POST /api HTTP/1.1\nHost: example.com\nContent-Length: 5\n\nhello world',
+  );
+  assertEquals(result.warnings.length, 1);
+  if (!/Content-Length/.test(result.warnings[0])) {
+    throw new Error(`unexpected warning: ${result.warnings[0]}`);
+  }
+});
+
+Deno.test('ok: Content-Length 与 body 字节数一致无 warning', () => {
+  const result = convert(
+    'POST /api HTTP/1.1\nHost: example.com\nContent-Length: 11\n\nhello world',
+  );
+  assertEquals(result.warnings, []);
+});
+
+Deno.test('ok: 无 body 且 Content-Length: 0 无 warning', () => {
+  const result = convert('POST /api HTTP/1.1\nHost: example.com\nContent-Length: 0\n');
+  assertEquals(result.warnings, []);
+});
+
+// 按 UTF-8 字节数比较：h + é(2B) + llo = 6 字节
+Deno.test('warn: 多字节字符按字节数计算（héllo 为 6 字节）', () => {
+  const result = convert(
+    'POST /api HTTP/1.1\nHost: example.com\nContent-Length: 5\n\nh\u00e9llo',
+  );
+  assertEquals(result.warnings.length, 1);
+});
+
+Deno.test('warn: Content-Length 非数字值', () => {
+  const result = convert(
+    'POST /api HTTP/1.1\nHost: example.com\nContent-Length: abc\n\nhello',
+  );
+  assertEquals(result.warnings.length, 1);
+  if (!/Content-Length/.test(result.warnings[0])) {
+    throw new Error(`unexpected warning: ${result.warnings[0]}`);
+  }
+});
