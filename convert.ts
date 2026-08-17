@@ -361,8 +361,23 @@ export function convert(httpText: string, options: Options = {}): ConvertResult 
   }
 
   // 3. 方法
+  // HEAD / GET 带 body：--data-binary 会让 curl 自动把方法切成 POST，
+  // --head 与 --data-binary 更是直接互斥（curl 报错），必须显式 --request 保持方法。
+  // 这种形态非标准但可表达：照常生成 + warning。
   if (method === 'HEAD') {
-    args.push(opt('--head', '-I'));
+    if (req.body) {
+      args.push(opt('--request', '-X'), 'HEAD');
+      warnings.push(
+        'HEAD 请求带 body（非标准但 curl 可表达），已改用 --request HEAD 保持方法；部分服务器/代理会拒绝此类请求',
+      );
+    } else {
+      args.push(opt('--head', '-I'));
+    }
+  } else if (method === 'GET' && req.body) {
+    args.push(opt('--request', '-X'), 'GET');
+    warnings.push(
+      'GET 请求带 body（非标准但 curl 可表达），已追加 --request GET 保持方法；部分服务器/代理会拒绝此类请求',
+    );
   } else if (method !== 'GET' && method !== 'POST') {
     args.push(opt('--request', '-X'), method);
   }
@@ -498,9 +513,24 @@ export function convert(httpText: string, options: Options = {}): ConvertResult 
   const rawUrl = absoluteForm
     ? req.path
     : `${opts.useHttp ? 'http' : 'https'}://${host}${req.path}`;
-  const url = rawUrl.replace(/[^\x00-\x7F]+/g, (s) => encodeURIComponent(s));
+  const url = rawUrl.replace(/[^\p{ASCII}]+/gu, (s) => encodeURIComponent(s));
   if (url !== rawUrl) {
     warnings.push('URL 含非 ASCII 字符，已按 UTF-8 百分号编码');
+  }
+  // curl glob 元字符：URL 路径/查询含 {} / [] 时，curl 默认会做 glob 展开
+  // （{a,b} 发多个请求、[abc] 直接报错），必须 --globoff 按字面发送。
+  // 只检查路径/查询部分：IPv6 主机的 [::1] 括号不是 glob，不能误报。
+  const authorityIdx = url.indexOf('://');
+  const afterAuthority = authorityIdx === -1 ? url : url.slice(authorityIdx + 3);
+  const pathOrQueryIdx = afterAuthority.search(/[/?#]/);
+  const pathAndQuery = pathOrQueryIdx === -1
+    ? ''
+    : afterAuthority.slice(pathOrQueryIdx).split('#')[0];
+  if (/[\[\]{}]/.test(pathAndQuery)) {
+    args.push(opt('--globoff', '-g'));
+    warnings.push(
+      'URL 路径/查询包含 [] 或 {}（curl glob 元字符），已追加 --globoff 按字面发送（不做百分号编码，保持 wire format 不变）',
+    );
   }
   args.push(shQuote(url));
 

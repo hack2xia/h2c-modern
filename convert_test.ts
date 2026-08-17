@@ -569,3 +569,90 @@ Deno.test('ows: header name 含后导空格警告', () => {
     throw new Error(`unexpected warning: ${result.warnings[0]}`);
   }
 });
+
+// ===== GET / HEAD 带 body：--data-binary 会把方法切成 POST，必须显式 --request 保持方法 =====
+
+Deno.test('get: 带 body 用 --request GET 保持方法 + warning', () => {
+  const result = convert('GET /search HTTP/1.1\nHost: example.com\n\nquery=1');
+  assertEquals(
+    result.command,
+    "curl --request GET --header 'User-Agent:' --header 'Accept:' --data-binary 'query=1' 'https://example.com/search'",
+  );
+  assertEquals(result.warnings.length, 1);
+  if (!/GET.*body/.test(result.warnings[0])) {
+    throw new Error(`unexpected warning: ${result.warnings[0]}`);
+  }
+});
+
+Deno.test('get: 带 body 短选项 -X GET', () => {
+  const result = convert('GET /search HTTP/1.1\nHost: example.com\n\nx', { shortOpt: true });
+  assertEquals(
+    result.command,
+    "curl -X GET -H 'User-Agent:' -H 'Accept:' --data-binary 'x' 'https://example.com/search'",
+  );
+  assertEquals(result.warnings.length, 1);
+});
+
+// HEAD + body：--head 与 --data-binary 互斥（curl 报错），改用 --request HEAD
+Deno.test('head: 带 body 用 --request HEAD + warning', () => {
+  const result = convert('HEAD /x HTTP/1.1\nHost: example.com\n\nhello');
+  assertEquals(
+    result.command,
+    "curl --request HEAD --header 'User-Agent:' --header 'Accept:' --data-binary 'hello' 'https://example.com/x'",
+  );
+  assertEquals(result.warnings.length, 1);
+  if (!/HEAD.*body/.test(result.warnings[0])) {
+    throw new Error(`unexpected warning: ${result.warnings[0]}`);
+  }
+});
+
+Deno.test('head: 无 body 仍用 --head', () => {
+  const result = convert('HEAD /x HTTP/1.1\nHost: example.com\n');
+  assertEquals(
+    result.command,
+    "curl --head --header 'User-Agent:' --header 'Accept:' 'https://example.com/x'",
+  );
+  assertEquals(result.warnings, []);
+});
+
+// ===== curl glob 元字符：{} / [] 会触发 glob 展开或直接报错，追加 --globoff 按字面发送 =====
+
+Deno.test('url: 路径含 {} 追加 --globoff + warning', () => {
+  const result = convert('GET /{a,b} HTTP/1.1\nHost: example.com\n');
+  assertEquals(
+    result.command,
+    "curl --header 'User-Agent:' --header 'Accept:' --globoff 'https://example.com/{a,b}'",
+  );
+  assertEquals(result.warnings.length, 1);
+  if (!/globoff/.test(result.warnings[0])) {
+    throw new Error(`unexpected warning: ${result.warnings[0]}`);
+  }
+});
+
+Deno.test('url: 查询参数含 [] 短选项 -g', () => {
+  const result = convert('GET /search?a[0]=1 HTTP/1.1\nHost: example.com\n', { shortOpt: true });
+  assertEquals(
+    result.command,
+    "curl -H 'User-Agent:' -H 'Accept:' -g 'https://example.com/search?a[0]=1'",
+  );
+  assertEquals(result.warnings.length, 1);
+});
+
+Deno.test('url: IPv6 主机括号不触发 globoff', () => {
+  const result = convert('GET /x HTTP/1.1\nHost: [::1]:8080\n');
+  assertEquals(
+    result.command,
+    "curl --header 'User-Agent:' --header 'Accept:' 'https://[::1]:8080/x'",
+  );
+  assertEquals(result.warnings, []);
+});
+
+Deno.test('url: absolute-form 含 {} 同样追加 --globoff', () => {
+  const result = convert('GET http://example.com/{a,b} HTTP/1.1\n');
+  // absolute-form + globoff 两条 warning
+  assertEquals(
+    result.command,
+    "curl --header 'User-Agent:' --header 'Accept:' --globoff 'http://example.com/{a,b}'",
+  );
+  assertEquals(result.warnings.length, 2);
+});

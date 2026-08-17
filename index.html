@@ -66,60 +66,60 @@ Host: example.com
     </footer>
 
     <script type="module">
-      import { convert, ConvertWarning } from './_build/convert.mjs';
+    import { convert, ConvertWarning } from './_build/convert.mjs';
 
-      const input = document.getElementById('input');
-      const output = document.getElementById('output');
-      const warnings = document.getElementById('warnings');
-      const copy = document.getElementById('copy');
+    const input = document.getElementById('input');
+    const output = document.getElementById('output');
+    const warnings = document.getElementById('warnings');
+    const copy = document.getElementById('copy');
 
-      const readOpts = () => ({
-        shortOpt: document.getElementById('opt-short').checked,
-        verbose: document.getElementById('opt-verbose').checked,
-        allowDefaultHeaders: document.getElementById('opt-default').checked,
-        sameHttpVersion: document.getElementById('opt-version').checked,
-        useHttp: document.getElementById('opt-http').checked,
-      });
+    const readOpts = () => ({
+      shortOpt: document.getElementById('opt-short').checked,
+      verbose: document.getElementById('opt-verbose').checked,
+      allowDefaultHeaders: document.getElementById('opt-default').checked,
+      sameHttpVersion: document.getElementById('opt-version').checked,
+      useHttp: document.getElementById('opt-http').checked,
+    });
 
-      function update() {
-        output.classList.remove('error', 'warning');
-        warnings.hidden = true;
-        warnings.textContent = '';
-        try {
-          const result = convert(input.value, readOpts());
-          output.textContent = result.command;
-          if (result.warnings.length > 0) {
-            warnings.textContent = result.warnings.map((w) => '⚠ ' + w).join('\n');
-            warnings.hidden = false;
-          }
-        } catch (e) {
-          if (e instanceof ConvertWarning) {
-            output.textContent = '⚠ ' + e.message;
-            output.classList.add('warning');
-          } else {
-            output.textContent = e.message;
-            output.classList.add('error');
-          }
+    function update() {
+      output.classList.remove('error', 'warning');
+      warnings.hidden = true;
+      warnings.textContent = '';
+      try {
+        const result = convert(input.value, readOpts());
+        output.textContent = result.command;
+        if (result.warnings.length > 0) {
+          warnings.textContent = result.warnings.map((w) => '⚠ ' + w).join('\n');
+          warnings.hidden = false;
+        }
+      } catch (e) {
+        if (e instanceof ConvertWarning) {
+          output.textContent = '⚠ ' + e.message;
+          output.classList.add('warning');
+        } else {
+          output.textContent = e.message;
+          output.classList.add('error');
         }
       }
+    }
 
-      input.addEventListener('input', update);
-      document
-        .querySelectorAll('.controls input')
-        .forEach((el) => el.addEventListener('change', update));
+    input.addEventListener('input', update);
+    document
+      .querySelectorAll('.controls input')
+      .forEach((el) => el.addEventListener('change', update));
 
-      copy.addEventListener('click', async () => {
-        try {
-          await navigator.clipboard.writeText(output.textContent);
-          copy.textContent = '已复制';
-          setTimeout(() => (copy.textContent = '复制'), 1500);
-        } catch {
-          /* 剪贴板不可用时静默 */
-        }
-      });
+    copy.addEventListener('click', async () => {
+      try {
+        await navigator.clipboard.writeText(output.textContent);
+        copy.textContent = '已复制';
+        setTimeout(() => (copy.textContent = '复制'), 1500);
+      } catch {
+        /* 剪贴板不可用时静默 */
+      }
+    });
 
-      input.value = 'GET / HTTP/1.1\nHost: example.com\n';
-      update();
+    input.value = 'GET / HTTP/1.1\nHost: example.com\n';
+    update();
     </script>
   </body>
 </html>

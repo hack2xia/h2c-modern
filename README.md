@@ -141,7 +141,10 @@ header 行、缺 `Host`（absolute-form 除外）、多个 `Host`、值不同的
 追加提醒）、obs-fold 折叠头（按 RFC 展开）、值相同的重复 `Content-Length`（忽略）、 `-i`
 遇到未识别的 HTTP 版本（不输出 flag）、URL 含非 ASCII 字符（按 UTF-8 百分号编码）、 Basic
 凭据解码后含非 ASCII 字节（超出 `user:password` 常规范围；RFC 7617 未规定编码， 不猜测编码，原样透传
-`Authorization` 头）。
+`Authorization` 头）、`GET` / `HEAD` 带 body（curl 的 `--data-binary` 会把方法切成 POST、 `--head`
+与 body 互斥，故追加 `--request GET` / `--request HEAD` 保持方法，部分服务器/代理会拒绝）、 URL
+路径/查询含 `{}` / `[]`（curl 默认把这类字符当 glob 展开：`{a,b}` 会发多个请求、`[abc]`
+直接报错；追加 `--globoff` 按字面发送，不做百分号编码，保持 wire format 不变）。
 
 - **方法**：`HEAD` → `--head`；`GET` → 默认；`POST` → `--data-binary`；其它 → `--request`
 - **请求体**：普通 → `--data-binary`；`multipart/form-data` → 解析为多个 `--form`
