@@ -1,0 +1,4 @@
+GET /data HTTP/1.1
+Host: example.com
+Cookie: sid=abc; theme=dark
+Accept-Encoding: gzip

@@ -1,0 +1,1 @@
+curl --header 'User-Agent:' --header 'Accept:' 'https://example.com/'

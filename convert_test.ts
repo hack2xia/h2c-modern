@@ -1,0 +1,571 @@
+// h2c-modern 测试：夹具驱动 + 选项覆盖 + 错误用例
+import { assertEquals, assertInstanceOf, assertThrows } from 'jsr:@std/assert@^1.0.19';
+import { convert, ConvertWarning } from './convert.ts';
+
+const testdataUrl = new URL('./testdata/', import.meta.url);
+
+function readFixture(name: string, ext: string): string {
+  return Deno.readTextFileSync(new URL(`./${name}.${ext}`, testdataUrl));
+}
+
+// 夹具驱动：遍历 testdata/*.http，与对应 *.curl 比对（夹具均为正常请求，不应有 warning）
+for (const entry of Deno.readDirSync(testdataUrl)) {
+  if (!entry.name.endsWith('.http')) continue;
+  const name = entry.name.replace(/\.http$/, '');
+  Deno.test(`fixture: ${name}`, () => {
+    const input = readFixture(name, 'http');
+    const expected = readFixture(name, 'curl').trimEnd();
+    const result = convert(input);
+    assertEquals(result.command.trimEnd(), expected);
+    assertEquals(result.warnings, []);
+  });
+}
+
+// 选项覆盖
+Deno.test('option: shortOpt', () => {
+  const input = readFixture('02_head', 'http');
+  assertEquals(
+    convert(input, { shortOpt: true }).command,
+    "curl -I -A 'myagent/1.0' -H 'Accept:' -H 'X-Custom: foo' 'https://example.com/document'",
+  );
+});
+
+Deno.test('option: verbose', () => {
+  const input = readFixture('01_get', 'http');
+  assertEquals(
+    convert(input, { verbose: true }).command,
+    "curl --verbose --header 'User-Agent:' --header 'Accept:' 'https://example.com/'",
+  );
+});
+
+Deno.test('option: allowDefaultHeaders', () => {
+  const input = readFixture('01_get', 'http');
+  assertEquals(
+    convert(input, { allowDefaultHeaders: true }).command,
+    "curl 'https://example.com/'",
+  );
+});
+
+Deno.test('option: sameHttpVersion', () => {
+  const input = readFixture('04_put_auth', 'http');
+  assertEquals(
+    convert(input, { sameHttpVersion: true }).command,
+    "curl --http2 --request PUT --user 'alice:secret' --header 'User-Agent:' --header 'Accept:' --header 'Content-Type: application/json' --data-binary '{\"x\":1}' 'https://api.example.com/items/1'",
+  );
+});
+
+Deno.test('option: useHttp', () => {
+  const input = readFixture('01_get', 'http');
+  assertEquals(
+    convert(input, { useHttp: true }).command,
+    "curl --header 'User-Agent:' --header 'Accept:' 'http://example.com/'",
+  );
+});
+
+// 错误用例
+Deno.test('error: missing Host header', () => {
+  assertThrows(() => convert('GET / HTTP/1.1\n'), Error, 'missing Host');
+});
+
+Deno.test('error: empty request', () => {
+  assertThrows(() => convert(''), Error, 'empty request');
+});
+
+// chunked：拒绝转换，抛 ConvertWarning（流式语义无法用 curl 命令表达）
+Deno.test('chunked: 拒绝转换并抛 ConvertWarning', () => {
+  const input = [
+    'POST /api HTTP/1.1',
+    'Host: api.example.com',
+    'Content-Type: text/plain',
+    'Transfer-Encoding: chunked',
+    '',
+    '5',
+    'Hello',
+    '0',
+    '',
+  ].join('\r\n');
+  try {
+    convert(input);
+    // 不应到达
+    throw new Error('expected ConvertWarning');
+  } catch (e) {
+    assertInstanceOf(e, ConvertWarning);
+    if (!/chunked/i.test(e.message)) {
+      throw new Error(`unexpected message: ${e.message}`);
+    }
+  }
+});
+
+// chunked 也接受 LF 行结束符的请求行
+Deno.test('chunked: LF 行结束符同样拒绝', () => {
+  const input = [
+    'POST /api HTTP/1.1',
+    'Host: api.example.com',
+    'Transfer-Encoding: chunked',
+    '',
+    '5',
+    'Hello',
+    '0',
+    '',
+  ].join('\n');
+  assertThrows(() => convert(input), ConvertWarning);
+});
+
+// Accept-Encoding: br 也应触发 --compressed
+Deno.test('encoding: br 触发 --compressed', () => {
+  const input = [
+    'GET / HTTP/1.1',
+    'Host: example.com',
+    'Accept-Encoding: br',
+    '',
+  ].join('\n');
+  assertEquals(
+    convert(input).command,
+    "curl --compressed --header 'User-Agent:' --header 'Accept:' 'https://example.com/'",
+  );
+});
+
+// Accept-Encoding: identity（不含已知编码）不应触发 --compressed
+Deno.test('encoding: identity 不触发 --compressed', () => {
+  const input = [
+    'GET / HTTP/1.1',
+    'Host: example.com',
+    'Accept-Encoding: identity',
+    '',
+  ].join('\n');
+  assertEquals(
+    convert(input).command,
+    "curl --header 'User-Agent:' --header 'Accept:' --header 'Accept-Encoding: identity' 'https://example.com/'",
+  );
+});
+
+// Bearer auth 应作为普通 header 透传
+Deno.test('auth: Bearer 透传为 header', () => {
+  assertEquals(
+    convert('GET / HTTP/1.1\nHost: example.com\nAuthorization: Bearer xyz\n').command,
+    "curl --header 'User-Agent:' --header 'Accept:' --header 'Authorization: Bearer xyz' 'https://example.com/'",
+  );
+});
+
+// multipart 缺 boundary：拒绝转换并抛 ConvertWarning（不静默产出丢失 body 的命令）
+Deno.test('multipart: 缺 boundary 抛 ConvertWarning', () => {
+  const input = [
+    'POST /upload HTTP/1.1',
+    'Host: example.com',
+    'Content-Type: multipart/form-data',
+    '',
+    'raw body',
+  ].join('\r\n');
+  assertThrows(() => convert(input), ConvertWarning, 'boundary');
+});
+
+// multipart 有 boundary 但解析不出任何 part：同样拒绝
+Deno.test('multipart: 无任何 part 抛 ConvertWarning', () => {
+  const input = [
+    'POST /upload HTTP/1.1',
+    'Host: example.com',
+    'Content-Type: multipart/form-data; boundary=xyz',
+    '',
+    'body without any boundary delimiter',
+  ].join('\r\n');
+  assertThrows(() => convert(input), ConvertWarning, 'part');
+});
+
+// 重复 Cookie 头：逐条透传为 -H，保持 wire format（安全工具常故意构造重复头，
+// 合并为 "; " 会改变线上字节；且 -H 'Cookie:' 会抑制 -b，不能混用）
+Deno.test('dup headers: 多个 Cookie 逐条透传', () => {
+  const input = [
+    'GET / HTTP/1.1',
+    'Host: example.com',
+    'Cookie: a=1',
+    'Cookie: b=2',
+    '',
+  ].join('\n');
+  assertEquals(
+    convert(input).command,
+    "curl --header 'User-Agent:' --header 'Accept:' --header 'Cookie: a=1' --header 'Cookie: b=2' 'https://example.com/'",
+  );
+});
+
+// 单个 Cookie 仍走 --cookie（更可读）
+Deno.test('dup headers: 单个 Cookie 用 --cookie', () => {
+  const input = ['GET / HTTP/1.1', 'Host: example.com', 'Cookie: a=1', ''].join('\n');
+  assertEquals(
+    convert(input).command,
+    "curl --cookie 'a=1' --header 'User-Agent:' --header 'Accept:' 'https://example.com/'",
+  );
+});
+
+// 重复 User-Agent：全部透传为 -H（混用 -A 与 -H 会被 curl 抑制掉 -A）
+Deno.test('dup headers: 重复 User-Agent 全部透传', () => {
+  const input = [
+    'GET / HTTP/1.1',
+    'Host: example.com',
+    'User-Agent: first/1.0',
+    'User-Agent: second/2.0',
+    '',
+  ].join('\n');
+  assertEquals(
+    convert(input).command,
+    "curl --header 'Accept:' --header 'User-Agent: first/1.0' --header 'User-Agent: second/2.0' 'https://example.com/'",
+  );
+});
+
+// ===== 总原则：明显错误拒绝；可能有问题则生成 + warning =====
+
+// 明显错误：请求行超过三段（多半是 URL 含未编码空格，截断会丢数据）
+Deno.test('error: 请求行超过三段拒绝', () => {
+  assertThrows(
+    () => convert('GET /hello world HTTP/1.1\nHost: example.com\n'),
+    Error,
+    'invalid request line',
+  );
+});
+
+// 明显错误：无冒号的 header 行（此前静默跳过会丢数据）
+Deno.test('error: 无冒号 header 行拒绝', () => {
+  assertThrows(
+    () => convert('GET / HTTP/1.1\nHost: example.com\ngarbage line\n'),
+    Error,
+    'invalid header line',
+  );
+});
+
+// 明显错误：多个 Host 头（RFC 7230 要求必须拒绝）
+Deno.test('error: 多个 Host 头拒绝', () => {
+  assertThrows(
+    () => convert('GET / HTTP/1.1\nHost: a.com\nHost: b.com\n'),
+    Error,
+    'multiple Host',
+  );
+});
+
+// 明显错误：值不同的重复 Content-Length（请求走私特征，无法忠实表达）
+Deno.test('error: 值不同的重复 Content-Length 拒绝', () => {
+  const input = [
+    'POST / HTTP/1.1',
+    'Host: example.com',
+    'Content-Length: 6',
+    'Content-Length: 5',
+    '',
+    'hello',
+  ].join('\r\n');
+  assertThrows(() => convert(input), ConvertWarning, 'Content-Length');
+});
+
+// 可能有问题：absolute-form 请求行 → 直接使用其中 URL + warning
+Deno.test('warn: absolute-form 请求行', () => {
+  const input = 'GET http://example.com/x HTTP/1.1\nHost: example.com\n';
+  const result = convert(input);
+  assertEquals(
+    result.command,
+    "curl --header 'User-Agent:' --header 'Accept:' 'http://example.com/x'",
+  );
+  assertEquals(result.warnings.length, 1);
+  if (!/absolute-form/.test(result.warnings[0])) {
+    throw new Error(`unexpected warning: ${result.warnings[0]}`);
+  }
+});
+
+// 可能有问题：absolute-form 与 Host 头不一致 → 追加提醒
+Deno.test('warn: absolute-form 与 Host 不一致', () => {
+  const input = 'GET http://a.com/x HTTP/1.1\nHost: b.com\n';
+  const result = convert(input);
+  assertEquals(result.warnings.length, 2);
+  if (!/不一致/.test(result.warnings[1])) {
+    throw new Error(`unexpected warning: ${result.warnings[1]}`);
+  }
+});
+
+// 可能有问题：absolute-form 缺 Host 头也可转换（URL 自包含）
+Deno.test('warn: absolute-form 无需 Host 头', () => {
+  const result = convert('GET http://example.com/ HTTP/1.1\n');
+  assertEquals(
+    result.command,
+    "curl --header 'User-Agent:' --header 'Accept:' 'http://example.com/'",
+  );
+});
+
+// 可能有问题：obs-fold 折叠头 → 展开合并 + warning
+Deno.test('warn: obs-fold 折叠头展开', () => {
+  const input = 'GET / HTTP/1.1\nHost: example.com\nX-Long: part1\n  part2\n';
+  const result = convert(input);
+  assertEquals(
+    result.command,
+    "curl --header 'User-Agent:' --header 'Accept:' --header 'X-Long: part1 part2' 'https://example.com/'",
+  );
+  assertEquals(result.warnings.length, 1);
+});
+
+// 可能有问题：值相同的重复 Content-Length → 忽略 + warning
+Deno.test('warn: 值相同的重复 Content-Length', () => {
+  const input = [
+    'POST / HTTP/1.1',
+    'Host: example.com',
+    'Content-Length: 5',
+    'Content-Length: 5',
+    '',
+    'hello',
+  ].join('\r\n');
+  const result = convert(input);
+  assertEquals(
+    result.command,
+    "curl --header 'User-Agent:' --header 'Accept:' --data-binary 'hello' 'https://example.com/'",
+  );
+  assertEquals(result.warnings.length, 1);
+});
+
+// 可能有问题：-i 遇到未识别的 HTTP 版本 → 不输出 flag + warning
+Deno.test('warn: 未识别的 HTTP 版本', () => {
+  const result = convert('GET / HTTP/3\nHost: example.com\n', { sameHttpVersion: true });
+  assertEquals(
+    result.command,
+    "curl --header 'User-Agent:' --header 'Accept:' 'https://example.com/'",
+  );
+  assertEquals(result.warnings.length, 1);
+});
+
+// 可能有问题：Basic 凭据解码后含非 ASCII 字节 → 不猜编码，原样透传 + warning
+Deno.test('warn: 非 ASCII Basic 凭据原样透传', () => {
+  // 'alice:密码' 的 UTF-8 base64
+  const encoded = btoa(
+    String.fromCharCode(...new TextEncoder().encode('alice:密码')),
+  );
+  const result = convert(`GET / HTTP/1.1\nHost: example.com\nAuthorization: Basic ${encoded}\n`);
+  assertEquals(
+    result.command,
+    `curl --header 'User-Agent:' --header 'Accept:' --header 'Authorization: Basic ${encoded}' 'https://example.com/'`,
+  );
+  assertEquals(result.warnings.length, 1);
+});
+
+// 纯 ASCII 的 Basic 凭据仍转 --user
+Deno.test('auth: ASCII Basic 转 --user', () => {
+  const encoded = btoa('alice:secret');
+  const result = convert(`GET / HTTP/1.1\nHost: example.com\nAuthorization: Basic ${encoded}\n`);
+  assertEquals(
+    result.command,
+    "curl --user 'alice:secret' --header 'User-Agent:' --header 'Accept:' 'https://example.com/'",
+  );
+  assertEquals(result.warnings, []);
+});
+
+// 可能有问题：URL 含非 ASCII 字符 → UTF-8 百分号编码 + warning
+Deno.test('warn: URL 非 ASCII 编码', () => {
+  const result = convert('GET /搜索?q=x HTTP/1.1\nHost: example.com\n');
+  assertEquals(
+    result.command,
+    "curl --header 'User-Agent:' --header 'Accept:' 'https://example.com/%E6%90%9C%E7%B4%A2?q=x'",
+  );
+  assertEquals(result.warnings, ['URL 含非 ASCII 字符，已按 UTF-8 百分号编码']);
+});
+
+// 已编码的 URL 不应被二次编码
+Deno.test('url: 已百分号编码的 URL 原样保留', () => {
+  const result = convert('GET /%E6%90%9C?q=x%20y HTTP/1.1\nHost: example.com\n');
+  assertEquals(
+    result.command,
+    "curl --header 'User-Agent:' --header 'Accept:' 'https://example.com/%E6%90%9C?q=x%20y'",
+  );
+  assertEquals(result.warnings, []);
+});
+
+// ===== HTTP/2 伪头检测：拒绝转换（h2c 仅处理 HTTP/1.x） =====
+Deno.test('error: HTTP/2 伪头拒绝转换', () => {
+  const input = [
+    'GET / HTTP/2',
+    'Host: example.com',
+    ':method: GET',
+    ':path: /',
+    ':authority: example.com',
+    '',
+  ].join('\n');
+  assertThrows(() => convert(input), Error, 'HTTP/2 伪头');
+});
+
+// 单个伪头也要拒绝（防止静默当成普通头解析）
+Deno.test('error: 单个 HTTP/2 伪头也拒绝', () => {
+  const input = 'GET / HTTP/1.1\nHost: example.com\n:authority: example.com\n';
+  assertThrows(() => convert(input), Error, 'HTTP/2 伪头');
+});
+
+// ===== POST 无 body：不再注入 --data-binary ''，改用 --request POST =====
+Deno.test('post: 无 body 用 --request POST 不注入 Content-Length', () => {
+  const result = convert('POST /api HTTP/1.1\nHost: example.com\n');
+  // 注：--request POST 追加在 -H 之后、URL 之前；顺序不影响 curl 行为
+  assertEquals(
+    result.command,
+    "curl --header 'User-Agent:' --header 'Accept:' --request POST 'https://example.com/api'",
+  );
+  assertEquals(result.warnings, []);
+});
+
+// POST 无 body 的短选项形态
+Deno.test('post: 无 body 短选项 -X POST', () => {
+  const result = convert('POST /api HTTP/1.1\nHost: example.com\n', { shortOpt: true });
+  assertEquals(
+    result.command,
+    "curl -H 'User-Agent:' -H 'Accept:' -X POST 'https://example.com/api'",
+  );
+});
+
+// POST 有 body 仍走 --data-binary（自动触发 POST，不追加 --request）
+Deno.test('post: 有 body 不追加 --request', () => {
+  const input = [
+    'POST /api HTTP/1.1',
+    'Host: example.com',
+    'Content-Length: 5',
+    '',
+    'hello',
+  ].join('\r\n');
+  assertEquals(
+    convert(input).command,
+    "curl --header 'User-Agent:' --header 'Accept:' --data-binary 'hello' 'https://example.com/api'",
+  );
+});
+
+// ===== 非标准 OWS：特殊头退化到 -H 透传 + warning =====
+
+// User-Agent 含前导多空格：退化到 -H
+Deno.test('ows: User-Agent 多空格退化到 -H', () => {
+  const input = 'GET / HTTP/1.1\nHost: example.com\nUser-Agent:  spaced/1.0\n';
+  const result = convert(input);
+  assertEquals(
+    result.command,
+    "curl --header 'Accept:' --header 'User-Agent:  spaced/1.0' 'https://example.com/'",
+  );
+  assertEquals(result.warnings.length, 1);
+  if (!/User-Agent.*非标准 OWS/.test(result.warnings[0])) {
+    throw new Error(`unexpected warning: ${result.warnings[0]}`);
+  }
+});
+
+// User-Agent 含后导空格：退化到 -H
+Deno.test('ows: User-Agent 后导空格退化到 -H', () => {
+  const input = 'GET / HTTP/1.1\nHost: example.com\nUser-Agent: trailing/1.0 \n';
+  const result = convert(input);
+  // 后导空格在 shQuote 内会被原样保留，curl 发送时含后导空格
+  assertEquals(
+    result.command,
+    "curl --header 'Accept:' --header 'User-Agent: trailing/1.0 ' 'https://example.com/'",
+  );
+  assertEquals(result.warnings.length, 1);
+});
+
+// User-Agent 含 HTAB：退化到 -H
+Deno.test('ows: User-Agent HTAB 退化到 -H', () => {
+  const input = 'GET / HTTP/1.1\nHost: example.com\nUser-Agent:\ttabbed/1.0\n';
+  const result = convert(input);
+  assertEquals(
+    result.command,
+    "curl --header 'Accept:' --header 'User-Agent:\ttabbed/1.0' 'https://example.com/'",
+  );
+  assertEquals(result.warnings.length, 1);
+});
+
+// Cookie 含非标准 OWS：退化到 -H
+Deno.test('ows: Cookie 多空格退化到 -H', () => {
+  const input = 'GET / HTTP/1.1\nHost: example.com\nCookie:  a=1\n';
+  const result = convert(input);
+  assertEquals(
+    result.command,
+    "curl --header 'User-Agent:' --header 'Accept:' --header 'Cookie:  a=1' 'https://example.com/'",
+  );
+  assertEquals(result.warnings.length, 1);
+});
+
+// Authorization 含非标准 OWS：退化到 -H
+Deno.test('ows: Authorization HTAB 退化到 -H', () => {
+  const input = 'GET / HTTP/1.1\nHost: example.com\nAuthorization:\tBasic abc\n';
+  const result = convert(input);
+  assertEquals(
+    result.command,
+    "curl --header 'User-Agent:' --header 'Accept:' --header 'Authorization:\tBasic abc' 'https://example.com/'",
+  );
+  assertEquals(result.warnings.length, 1);
+});
+
+// 标准 OWS（1 个前导 SP）仍走专属选项，无 warning
+Deno.test('ows: 标准 1 SP 仍用专属选项', () => {
+  const input = 'GET / HTTP/1.1\nHost: example.com\nUser-Agent: normal/1.0\n';
+  const result = convert(input);
+  assertEquals(
+    result.command,
+    "curl --user-agent 'normal/1.0' --header 'Accept:' 'https://example.com/'",
+  );
+  assertEquals(result.warnings, []);
+});
+
+// 无前导 OWS（Name:value 紧挨）也走专属选项
+Deno.test('ows: 无前导 OWS 也走专属选项', () => {
+  const input = 'GET / HTTP/1.1\nHost:example.com\nUser-Agent:normal/1.0\n';
+  const result = convert(input);
+  assertEquals(
+    result.command,
+    "curl --user-agent 'normal/1.0' --header 'Accept:' 'https://example.com/'",
+  );
+  assertEquals(result.warnings, []);
+});
+
+// 普通 -H 透传：标准 1 SP 输出形态保持原样
+Deno.test('ows: 普通 header 标准 SP 形态', () => {
+  const input = 'GET / HTTP/1.1\nHost: example.com\nX-Custom: foo\n';
+  const result = convert(input);
+  assertEquals(
+    result.command,
+    "curl --header 'User-Agent:' --header 'Accept:' --header 'X-Custom: foo' 'https://example.com/'",
+  );
+  assertEquals(result.warnings, []);
+});
+
+// 普通 -H 透传：无前导 SP（Name:value）保持原样
+Deno.test('ows: 普通 header 无前导 SP 形态', () => {
+  const input = 'GET / HTTP/1.1\nHost: example.com\nX-Custom:foo\n';
+  const result = convert(input);
+  assertEquals(
+    result.command,
+    "curl --header 'User-Agent:' --header 'Accept:' --header 'X-Custom:foo' 'https://example.com/'",
+  );
+  assertEquals(result.warnings, []);
+});
+
+// 普通 -H 透传：多空格保持原样（不剥离）
+Deno.test('ows: 普通 header 多空格保持原样', () => {
+  const input = 'GET / HTTP/1.1\nHost: example.com\nX-Custom:  foo\n';
+  const result = convert(input);
+  assertEquals(
+    result.command,
+    "curl --header 'User-Agent:' --header 'Accept:' --header 'X-Custom:  foo' 'https://example.com/'",
+  );
+  assertEquals(result.warnings, []);
+});
+
+// Host 头含非标准 OWS：URL 中剥离 + warning
+Deno.test('ows: Host 含非标准 OWS 剥离 + warning', () => {
+  const input = 'GET / HTTP/1.1\nHost:\texample.com\n';
+  const result = convert(input);
+  assertEquals(
+    result.command,
+    "curl --header 'User-Agent:' --header 'Accept:' 'https://example.com/'",
+  );
+  assertEquals(result.warnings.length, 1);
+  if (!/Host.*非标准 OWS/.test(result.warnings[0])) {
+    throw new Error(`unexpected warning: ${result.warnings[0]}`);
+  }
+});
+
+// header name 含前后空白：警告 + 剥离
+// 注意：行首为空白会被 obs-fold 当续行处理，故只测 name 含后导空格的情况
+Deno.test('ows: header name 含后导空格警告', () => {
+  const input = 'GET / HTTP/1.1\nHost: example.com\nX-Custom : foo\n';
+  const result = convert(input);
+  // name "X-Custom " 含后导空格，已剥离；value 含标准前导 SP
+  assertEquals(
+    result.command,
+    "curl --header 'User-Agent:' --header 'Accept:' --header 'X-Custom: foo' 'https://example.com/'",
+  );
+  assertEquals(result.warnings.length, 1);
+  if (!/header name.*空白/.test(result.warnings[0])) {
+    throw new Error(`unexpected warning: ${result.warnings[0]}`);
+  }
+});

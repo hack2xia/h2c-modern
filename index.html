@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>h2c - headers to curl</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <header>
+      <span class="mark">h2c</span>
+      <span class="title">headers to curl</span>
+      <span class="sub">HTTP 请求 → curl 命令，本地转换</span>
+    </header>
+
+    <main>
+      <div class="panels">
+        <div class="panel req">
+          <label><span class="dot"></span>HTTP 请求</label>
+          <textarea
+            id="input"
+            spellcheck="false"
+            placeholder="GET / HTTP/1.1
+Host: example.com
+"
+          ></textarea>
+        </div>
+        <div class="panel res">
+          <label><span class="dot"></span>curl 命令</label>
+          <pre id="output"></pre>
+          <div id="warnings" hidden></div>
+        </div>
+      </div>
+
+      <div class="controls">
+        <label class="chip">
+          <input type="checkbox" id="opt-short" />
+          <span class="tick"></span>短选项
+        </label>
+        <label class="chip">
+          <input type="checkbox" id="opt-verbose" />
+          <span class="tick"></span>verbose
+        </label>
+        <label class="chip">
+          <input type="checkbox" id="opt-default" />
+          <span class="tick"></span>允许默认头
+        </label>
+        <label class="chip">
+          <input type="checkbox" id="opt-version" />
+          <span class="tick"></span>HTTP 版本
+        </label>
+        <label class="chip">
+          <input type="checkbox" id="opt-http" />
+          <span class="tick"></span>http://
+        </label>
+        <button id="copy" type="button">复制</button>
+      </div>
+    </main>
+
+    <footer>
+      转换在浏览器本地完成，数据不上传 · <a
+        href="https://github.com/curl/h2c"
+        target="_blank"
+        rel="noopener"
+      >原始项目</a>
+    </footer>
+
+    <script type="module">
+      import { convert, ConvertWarning } from './_build/convert.mjs';
+
+      const input = document.getElementById('input');
+      const output = document.getElementById('output');
+      const warnings = document.getElementById('warnings');
+      const copy = document.getElementById('copy');
+
+      const readOpts = () => ({
+        shortOpt: document.getElementById('opt-short').checked,
+        verbose: document.getElementById('opt-verbose').checked,
+        allowDefaultHeaders: document.getElementById('opt-default').checked,
+        sameHttpVersion: document.getElementById('opt-version').checked,
+        useHttp: document.getElementById('opt-http').checked,
+      });
+
+      function update() {
+        output.classList.remove('error', 'warning');
+        warnings.hidden = true;
+        warnings.textContent = '';
+        try {
+          const result = convert(input.value, readOpts());
+          output.textContent = result.command;
+          if (result.warnings.length > 0) {
+            warnings.textContent = result.warnings.map((w) => '⚠ ' + w).join('\n');
+            warnings.hidden = false;
+          }
+        } catch (e) {
+          if (e instanceof ConvertWarning) {
+            output.textContent = '⚠ ' + e.message;
+            output.classList.add('warning');
+          } else {
+            output.textContent = e.message;
+            output.classList.add('error');
+          }
+        }
+      }
+
+      input.addEventListener('input', update);
+      document
+        .querySelectorAll('.controls input')
+        .forEach((el) => el.addEventListener('change', update));
+
+      copy.addEventListener('click', async () => {
+        try {
+          await navigator.clipboard.writeText(output.textContent);
+          copy.textContent = '已复制';
+          setTimeout(() => (copy.textContent = '复制'), 1500);
+        } catch {
+          /* 剪贴板不可用时静默 */
+        }
+      });
+
+      input.value = 'GET / HTTP/1.1\nHost: example.com\n';
+      update();
+    </script>
+  </body>
+</html>

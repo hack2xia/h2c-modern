@@ -1,0 +1,6 @@
+PUT /items/1 HTTP/2
+Host: api.example.com
+Content-Type: application/json
+Authorization: Basic YWxpY2U6c2VjcmV0
+
+{"x":1}

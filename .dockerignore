@@ -1,0 +1,11 @@
+.git
+.gitignore
+testdata
+_build
+h2c
+*.md
+deno.json
+convert_test.ts
+cli.ts
+Dockerfile
+.dockerignore

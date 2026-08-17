@@ -1,0 +1,4 @@
+HEAD /document HTTP/1.1
+Host: example.com
+User-Agent: myagent/1.0
+X-Custom: foo
