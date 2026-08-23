@@ -1,5 +1,5 @@
 // h2c-modern 测试：夹具驱动 + 选项覆盖 + 错误用例
-import { assertEquals, assertInstanceOf, assertThrows } from 'jsr:@std/assert@^1.0.19';
+import { assert, assertEquals, assertInstanceOf, assertThrows } from 'jsr:@std/assert@^1.0.19';
 import { convert, ConvertWarning } from './convert.ts';
 
 const testdataUrl = new URL('./testdata/', import.meta.url);
@@ -272,7 +272,7 @@ Deno.test('warn: absolute-form 与 Host 不一致', () => {
   const input = 'GET http://a.com/x HTTP/1.1\nHost: b.com\n';
   const result = convert(input);
   assertEquals(result.warnings.length, 2);
-  if (!/不一致/.test(result.warnings[1])) {
+  if (!/does not match/.test(result.warnings[1])) {
     throw new Error(`unexpected warning: ${result.warnings[1]}`);
   }
 });
@@ -357,7 +357,7 @@ Deno.test('warn: URL 非 ASCII 编码', () => {
     result.command,
     "curl --header 'User-Agent:' --header 'Accept:' 'https://example.com/%E6%90%9C%E7%B4%A2?q=x'",
   );
-  assertEquals(result.warnings, ['URL 含非 ASCII 字符，已按 UTF-8 百分号编码']);
+  assertEquals(result.warnings, ['URL contains non-ASCII characters; percent-encoded as UTF-8']);
 });
 
 // 已编码的 URL 不应被二次编码
@@ -380,13 +380,42 @@ Deno.test('error: HTTP/2 伪头拒绝转换', () => {
     ':authority: example.com',
     '',
   ].join('\n');
-  assertThrows(() => convert(input), Error, 'HTTP/2 伪头');
+  assertThrows(() => convert(input), Error, 'HTTP/2 pseudo-header');
 });
 
 // 单个伪头也要拒绝（防止静默当成普通头解析）
 Deno.test('error: 单个 HTTP/2 伪头也拒绝', () => {
   const input = 'GET / HTTP/1.1\nHost: example.com\n:authority: example.com\n';
-  assertThrows(() => convert(input), Error, 'HTTP/2 伪头');
+  assertThrows(() => convert(input), Error, 'HTTP/2 pseudo-header');
+});
+
+// ===== request-target 形态校验（RFC 7230 §5.3）：非四种合法形态拒绝 =====
+
+// 裸 target（非 / 开头、非 absolute/asterisk 形态）：静默拼接会产出 host/path 粘连的垃圾 URL
+Deno.test('error: 非 origin-form/absolute-form/asterisk-form 的 target 拒绝', () => {
+  assertThrows(
+    () => convert('GET foo HTTP/1.1\nHost: example.com\n'),
+    Error,
+    'invalid request-target',
+  );
+});
+
+// authority-form 仅限 CONNECT：GET 带 authority-form 同样拒绝
+Deno.test('error: 非 CONNECT 的 authority-form target 拒绝', () => {
+  assertThrows(
+    () => convert('GET example.com:8080 HTTP/1.1\nHost: example.com\n'),
+    Error,
+    'invalid request-target',
+  );
+});
+
+// asterisk-form 仅限 OPTIONS
+Deno.test('error: asterisk-form 仅限 OPTIONS', () => {
+  assertThrows(
+    () => convert('GET * HTTP/1.1\nHost: example.com\n'),
+    Error,
+    'asterisk-form',
+  );
 });
 
 // ===== POST 无 body：不再注入 --data-binary ''，改用 --request POST =====
@@ -435,7 +464,7 @@ Deno.test('ows: User-Agent 多空格退化到 -H', () => {
     "curl --header 'Accept:' --header 'User-Agent:  spaced/1.0' 'https://example.com/'",
   );
   assertEquals(result.warnings.length, 1);
-  if (!/User-Agent.*非标准 OWS/.test(result.warnings[0])) {
+  if (!/User-Agent.*non-standard OWS/.test(result.warnings[0])) {
     throw new Error(`unexpected warning: ${result.warnings[0]}`);
   }
 });
@@ -549,7 +578,7 @@ Deno.test('ows: Host 含非标准 OWS 剥离 + warning', () => {
     "curl --header 'User-Agent:' --header 'Accept:' 'https://example.com/'",
   );
   assertEquals(result.warnings.length, 1);
-  if (!/Host.*非标准 OWS/.test(result.warnings[0])) {
+  if (!/Host.*non-standard OWS/.test(result.warnings[0])) {
     throw new Error(`unexpected warning: ${result.warnings[0]}`);
   }
 });
@@ -565,7 +594,7 @@ Deno.test('ows: header name 含后导空格警告', () => {
     "curl --header 'User-Agent:' --header 'Accept:' --header 'X-Custom: foo' 'https://example.com/'",
   );
   assertEquals(result.warnings.length, 1);
-  if (!/header name.*空白/.test(result.warnings[0])) {
+  if (!/header name.*whitespace/.test(result.warnings[0])) {
     throw new Error(`unexpected warning: ${result.warnings[0]}`);
   }
 });
@@ -664,7 +693,7 @@ Deno.test('warn: Content-Length 大于 body 字节数（可能截断）', () => 
     'POST /api HTTP/1.1\nHost: example.com\nContent-Length: 100\n\nhello world',
   );
   assertEquals(result.warnings.length, 1);
-  if (!/Content-Length/.test(result.warnings[0]) || !/截断/.test(result.warnings[0])) {
+  if (!/Content-Length/.test(result.warnings[0]) || !/truncated/.test(result.warnings[0])) {
     throw new Error(`unexpected warning: ${result.warnings[0]}`);
   }
 });
@@ -826,5 +855,57 @@ Deno.test('shell: 默认 sh 方言回归', () => {
     result.command,
     "curl --header 'User-Agent:' --header 'Accept:' --header 'Content-Type: text/plain' --data-binary 'it'\\''s ok' 'https://example.com/a'",
   );
+  assertEquals(result.warnings, []);
+});
+
+// ===== --user 的方言转义：Basic 凭据含撇号时 powershell 也要按 '' 翻倍 =====
+
+Deno.test('shell: powershell Basic 凭据撇号翻倍', () => {
+  const encoded = btoa("alice:it's");
+  const result = convert(
+    `GET / HTTP/1.1\nHost: example.com\nAuthorization: Basic ${encoded}\n`,
+    { shell: 'powershell' },
+  );
+  assertEquals(
+    result.command,
+    "curl.exe --user 'alice:it''s' --header 'User-Agent:' --header 'Accept:' 'https://example.com/'",
+  );
+  assertEquals(result.warnings, []);
+});
+
+// 对照：sh 方言下撇号凭据仍是 '\'' 转义
+Deno.test('shell: sh Basic 凭据撇号转义', () => {
+  const encoded = btoa("alice:it's");
+  const result = convert(
+    `GET / HTTP/1.1\nHost: example.com\nAuthorization: Basic ${encoded}\n`,
+  );
+  assertEquals(
+    result.command,
+    "curl --user 'alice:it'\\''s' --header 'User-Agent:' --header 'Accept:' 'https://example.com/'",
+  );
+  assertEquals(result.warnings, []);
+});
+
+// ===== powershell 方言 + 参数值含双引号：PS 5.1 传参会破坏此类参数，提示需 7.3+ =====
+
+Deno.test('shell: powershell 参数含双引号提示 PS 5.1 兼容性', () => {
+  const result = convert(
+    'POST /a HTTP/1.1\nHost: example.com\nContent-Type: application/json\n\n{"x": 1, "y": "z z"}',
+    { shell: 'powershell' },
+  );
+  // 命令照常生成（语法本身正确），仅追加 warning
+  assert(/--data-binary/.test(result.command));
+  assertEquals(result.warnings.length, 1);
+  if (!/PowerShell 5\.1/.test(result.warnings[0])) {
+    throw new Error(`unexpected warning: ${result.warnings[0]}`);
+  }
+});
+
+// 对照：sh 方言下双引号参数无此问题，不产生 warning
+Deno.test('shell: sh 参数含双引号无 warning', () => {
+  const result = convert(
+    'POST /a HTTP/1.1\nHost: example.com\nContent-Type: application/json\n\n{"x": 1}',
+  );
+  assert(/--data-binary/.test(result.command));
   assertEquals(result.warnings, []);
 });

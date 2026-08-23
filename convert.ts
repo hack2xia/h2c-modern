@@ -98,6 +98,25 @@ function parse(input: string): ParseResult {
   const path = parts[1];
   const httpVersion = parts[2] ?? 'HTTP/1.1';
 
+  // request-target 形态校验（RFC 7230 §5.3）：HTTP/1.x 只允许 origin-form（/ 开头）、
+  // absolute-form（完整 URL）、asterisk-form（仅 OPTIONS）、authority-form（仅 CONNECT）。
+  // 裸 "foo" 或非 CONNECT 的 authority-form 若静默拼接会产出 host/path 粘连的垃圾 URL
+  // （如 https://example.comfoo），属明显错误，拒绝。
+  const upperMethod = method.toUpperCase();
+  if (
+    !path.startsWith('/') && !/^https?:\/\//i.test(path) && path !== '*' &&
+    upperMethod !== 'CONNECT'
+  ) {
+    throw new Error(
+      `invalid request-target "${path}": expected origin-form (/...), absolute-form (http://...), or asterisk-form (OPTIONS *)`,
+    );
+  }
+  if (path === '*' && upperMethod !== 'OPTIONS') {
+    throw new Error(
+      `asterisk-form request-target is only valid for OPTIONS (got ${upperMethod})`,
+    );
+  }
+
   const headers: Header[] = [];
   let obsFolded = false;
   for (let i = 1; i < lines.length; i++) {
@@ -113,7 +132,7 @@ function parse(input: string): ParseResult {
     // 静默当成普通 header 解析会产出语义错乱的命令。明确拒绝并提示。
     if (line[0] === ':') {
       throw new Error(
-        `HTTP/2 伪头不被支持: ${line}（h2c 仅处理 HTTP/1.x 请求报文，请使用 HTTP/1.x 形态）`,
+        `HTTP/2 pseudo-headers are not supported: ${line} (h2c only handles HTTP/1.x request messages)`,
       );
     }
     const colon = line.indexOf(':');
@@ -126,7 +145,7 @@ function parse(input: string): ParseResult {
     // field-name (RFC 7230) 是 token，不允许前后空白；含空白属非法但实流量中可能存在
     if (rawName !== rawName.trim()) {
       warnings.push(
-        `header name "${rawName}" 含前后空白，已剥离（field-name 按 RFC 7230 不允许空白）`,
+        `header name "${rawName}" has surrounding whitespace; stripped (RFC 7230 field-name does not allow whitespace)`,
       );
     }
     headers.push({
@@ -138,7 +157,7 @@ function parse(input: string): ParseResult {
     });
   }
   if (obsFolded) {
-    warnings.push('请求包含折叠头（obs-fold），已按 RFC 7230 展开合并');
+    warnings.push('request contains obs-fold (deprecated header folding); unfolded per RFC 7230');
   }
 
   // chunked Transfer-Encoding：流式语义无法用 curl 命令表达，调用方应拒绝
@@ -197,7 +216,7 @@ function parseMultipart(req: ParsedRequest): string[] {
   const m = ct.match(/boundary=("?)([^";]+)\1/i);
   if (!m) {
     throw new ConvertWarning(
-      'multipart/form-data 缺少 boundary 参数，无法解析请求体。请检查原始请求是否完整。',
+      'multipart/form-data is missing the boundary parameter; cannot parse the body. Check that the original request is complete.',
     );
   }
   const boundary = m[2];
@@ -243,7 +262,7 @@ function parseMultipart(req: ParsedRequest): string[] {
 
   if (forms.length === 0 && req.body.trim()) {
     throw new ConvertWarning(
-      'multipart 请求体解析失败：boundary 存在但未找到任何 part。请检查原始请求是否完整。',
+      'failed to parse multipart body: boundary exists but no parts found. Check that the original request is complete.',
     );
   }
 
@@ -296,8 +315,7 @@ export function convert(httpText: string, options: Options = {}): ConvertResult 
   // 与 chunked 同属"无法忠实表达"，拒绝（复现流量应使用 --proxy 系列选项而非转换报文）。
   if (method === 'CONNECT') {
     throw new ConvertWarning(
-      'CONNECT 是代理隧道控制报文，curl 命令无法表达隧道语义' +
-        '（复现流量应使用 --proxy 而非转换报文本身），拒绝转换。',
+      'CONNECT is a proxy tunnel control message; a single curl command cannot express tunnel semantics (reproduce the traffic with --proxy options instead). Refusing to convert.',
     );
   }
 
@@ -306,9 +324,7 @@ export function convert(httpText: string, options: Options = {}): ConvertResult 
   // 生成的命令必然发送错误数据，拒绝；建议提取 body 为文件后手动用 --data-binary @文件。
   if (req.body.includes('\uFFFD')) {
     throw new ConvertWarning(
-      '请求体含 U+FFFD 替换字符——原始报文很可能包含二进制或非 UTF-8 字节，' +
-        '在粘贴/解码过程中已被损坏。shell 参数无法承载任意字节，拒绝转换；' +
-        '可将请求体提取为文件后手动改用 --data-binary @文件。',
+      'body contains U+FFFD replacement characters — the original message most likely contains binary or non-UTF-8 bytes that were already corrupted during pasting/decoding. Shell arguments cannot carry arbitrary bytes; refusing to convert. Extract the body into a file and use --data-binary @file manually.',
     );
   }
 
@@ -333,7 +349,7 @@ export function convert(httpText: string, options: Options = {}): ConvertResult 
       host = stripStandardOWS(host);
     } else {
       warnings.push(
-        'Host 头含非标准 OWS，URL 中已剥离所有空白（URL 不允许空白字节）',
+        'Host header has non-standard OWS; all whitespace stripped for the URL (URLs cannot contain whitespace bytes)',
       );
       host = host.trim();
     }
@@ -342,7 +358,7 @@ export function convert(httpText: string, options: Options = {}): ConvertResult 
     throw new Error('missing Host header');
   }
   if (absoluteForm) {
-    warnings.push('请求行为 absolute-form（含完整 URL），已直接使用其中的 URL');
+    warnings.push('request line is absolute-form (contains a full URL); using that URL directly');
     let authority: string | undefined;
     try {
       authority = new URL(req.path).host;
@@ -351,7 +367,7 @@ export function convert(httpText: string, options: Options = {}): ConvertResult 
     }
     if (host && host !== authority) {
       warnings.push(
-        `absolute-form URL 的 authority(${authority})与 Host 头(${host})不一致，已使用请求行中的 URL`,
+        `absolute-form URL authority (${authority}) does not match the Host header (${host}); using the URL from the request line`,
       );
     }
   }
@@ -360,12 +376,13 @@ export function convert(httpText: string, options: Options = {}): ConvertResult 
   const clValues = getHeaderValues(req.headers, 'content-length');
   if (clValues.length > 1) {
     if (new Set(clValues).size === 1) {
-      warnings.push('存在多个相同的 Content-Length 头，已忽略（curl 会自动计算）');
+      warnings.push(
+        'multiple identical Content-Length headers; ignored (curl computes it automatically)',
+      );
     } else {
       // 值不一致的重复 CL 是请求走私特征，curl 无法忠实表达
       throw new ConvertWarning(
-        '存在多个值不同的 Content-Length 头（HTTP 请求走私特征），' +
-          'curl 命令无法忠实表达，拒绝转换。',
+        'multiple Content-Length headers with different values (an HTTP request smuggling signature); a curl command cannot express this faithfully. Refusing to convert.',
       );
     }
   }
@@ -376,7 +393,7 @@ export function convert(httpText: string, options: Options = {}): ConvertResult 
     const cl = clValues[0].trim();
     if (!/^\d+$/.test(cl)) {
       warnings.push(
-        `Content-Length 值 "${cl}" 不是合法数字，已忽略（curl 会自动按 body 实际字节数计算）`,
+        `Content-Length value "${cl}" is not a valid number; ignored (curl computes it from the actual body)`,
       );
     } else {
       const actual = new TextEncoder().encode(req.body).length;
@@ -384,13 +401,11 @@ export function convert(httpText: string, options: Options = {}): ConvertResult 
       if (declared !== actual) {
         if (actual < declared) {
           warnings.push(
-            `Content-Length 声明 ${declared} 字节，但 body 实际只有 ${actual} 字节` +
-              `——请求体可能被截断，请检查原始请求是否完整（curl 将按实际长度发送）`,
+            `Content-Length declares ${declared} bytes but the body is only ${actual} bytes — the body may be truncated; check the original request (curl will send the actual length)`,
           );
         } else {
           warnings.push(
-            `Content-Length 声明 ${declared} 字节，但 body 实际为 ${actual} 字节` +
-              `——不一致，curl 将按实际长度发送`,
+            `Content-Length declares ${declared} bytes but the body is ${actual} bytes — inconsistent; curl will send the actual length`,
           );
         }
       }
@@ -403,8 +418,7 @@ export function convert(httpText: string, options: Options = {}): ConvertResult 
   const te = getHeader(req.headers, 'transfer-encoding');
   if (te && /\bchunked\b/i.test(te)) {
     throw new ConvertWarning(
-      'chunked Transfer-Encoding 无法转换为等价的 curl 命令：流式分块语义在命令行中丢失，' +
-        '解码后会改变 wire format。建议改用 Content-Length 请求体后重试。',
+      'Transfer-Encoding: chunked cannot be converted to an equivalent curl command: streaming chunk semantics are lost on a command line, and decoding would change the wire format. Retry with a Content-Length body instead.',
     );
   }
 
@@ -427,7 +441,7 @@ export function convert(httpText: string, options: Options = {}): ConvertResult 
     if (v === 'HTTP/1.0') args.push('--http1.0');
     else if (v === 'HTTP/1.1') args.push('--http1.1');
     else if (v === 'HTTP/2') args.push('--http2');
-    else warnings.push(`未识别的 HTTP 版本 ${req.httpVersion}，未输出版本选项`);
+    else warnings.push(`unrecognized HTTP version ${req.httpVersion}; no version option emitted`);
   }
 
   // 3. 方法
@@ -438,7 +452,7 @@ export function convert(httpText: string, options: Options = {}): ConvertResult 
     if (req.body) {
       args.push(opt('--request', '-X'), 'HEAD');
       warnings.push(
-        'HEAD 请求带 body（非标准但 curl 可表达），已改用 --request HEAD 保持方法；部分服务器/代理会拒绝此类请求',
+        'HEAD request with a body (non-standard but expressible with curl); using --request HEAD to keep the method; some servers/proxies reject such requests',
       );
     } else {
       args.push(opt('--head', '-I'));
@@ -446,7 +460,7 @@ export function convert(httpText: string, options: Options = {}): ConvertResult 
   } else if (method === 'GET' && req.body) {
     args.push(opt('--request', '-X'), 'GET');
     warnings.push(
-      'GET 请求带 body（非标准但 curl 可表达），已追加 --request GET 保持方法；部分服务器/代理会拒绝此类请求',
+      'GET request with a body (non-standard but expressible with curl); added --request GET to keep the method; some servers/proxies reject such requests',
     );
   } else if (method !== 'GET' && method !== 'POST') {
     args.push(opt('--request', '-X'), method);
@@ -470,7 +484,7 @@ export function convert(httpText: string, options: Options = {}): ConvertResult 
       args.push(opt('--user-agent', '-A'), q(stripStandardOWS(ua)));
     } else {
       warnings.push(
-        'User-Agent 头含非标准 OWS（前导多空格/HTAB/后导空白），已原样透传为 -H 以保持 wire format',
+        'User-Agent header has non-standard OWS (leading spaces/HTAB/trailing whitespace); passed through as -H to preserve the wire format',
       );
     }
   }
@@ -483,7 +497,7 @@ export function convert(httpText: string, options: Options = {}): ConvertResult 
       args.push(opt('--cookie', '-b'), q(stripStandardOWS(cookie)));
     } else {
       warnings.push(
-        'Cookie 头含非标准 OWS（前导多空格/HTAB/后导空白），已原样透传为 -H 以保持 wire format',
+        'Cookie header has non-standard OWS (leading spaces/HTAB/trailing whitespace); passed through as -H to preserve the wire format',
       );
     }
   }
@@ -498,7 +512,7 @@ export function convert(httpText: string, options: Options = {}): ConvertResult 
       encodingConsumed = true;
     } else if (!isStandardOWS(ae)) {
       warnings.push(
-        'Accept-Encoding 头含非标准 OWS，已原样透传为 -H（未使用 --compressed 以保持 wire format）',
+        'Accept-Encoding header has non-standard OWS; passed through as -H (not using --compressed, to preserve the wire format)',
       );
     }
   }
@@ -518,10 +532,10 @@ export function convert(httpText: string, options: Options = {}): ConvertResult 
             // 解码后超出 user:password 常规字符范围：RFC 7617 未规定编码，
             // 猜编码重编码会改变 wire format，故原样透传 Authorization 头并提醒
             warnings.push(
-              'Basic 凭据解码后含非 ASCII 字节，已原样透传 Authorization 头（不猜测编码），请确认',
+              'Basic credentials decode to non-ASCII bytes; passing the Authorization header through verbatim (not guessing an encoding) — please verify',
             );
           } else {
-            args.push(opt('--user', '-u'), shQuote(decoded));
+            args.push(opt('--user', '-u'), q(decoded));
             authConsumed = true;
           }
         } catch {
@@ -530,7 +544,7 @@ export function convert(httpText: string, options: Options = {}): ConvertResult 
       }
     } else {
       warnings.push(
-        'Authorization 头含非标准 OWS，已原样透传为 -H 以保持 wire format',
+        'Authorization header has non-standard OWS; passed through as -H to preserve the wire format',
       );
     }
   }
@@ -570,7 +584,7 @@ export function convert(httpText: string, options: Options = {}): ConvertResult 
   // 默认头抑制同一手法），否则线上字节被改变。
   const hasContentType = getHeader(req.headers, 'content-type') !== undefined;
   const suppressDefaultCT = () => {
-    if (!hasContentType) args.push(opt('--header', '-H'), shQuote('Content-Type:'));
+    if (!hasContentType) args.push(opt('--header', '-H'), q('Content-Type:'));
   };
   // 原始请求显式声明 Content-Length: 0（POST/PUT 无 body 时常见）：curl 默认一个 CL 头都
   // 不发，与原报文不一致；--data-binary '' 让 curl 实际发送 Content-Length: 0。
@@ -603,7 +617,7 @@ export function convert(httpText: string, options: Options = {}): ConvertResult 
     : `${opts.useHttp ? 'http' : 'https'}://${host}${asteriskForm ? '' : req.path}`;
   const url = rawUrl.replace(/[^\p{ASCII}]+/gu, (s) => encodeURIComponent(s));
   if (url !== rawUrl) {
-    warnings.push('URL 含非 ASCII 字符，已按 UTF-8 百分号编码');
+    warnings.push('URL contains non-ASCII characters; percent-encoded as UTF-8');
   }
   // curl glob 元字符：URL 路径/查询含 {} / [] 时，curl 默认会做 glob 展开
   // （{a,b} 发多个请求、[abc] 直接报错），必须 --globoff 按字面发送。
@@ -617,16 +631,25 @@ export function convert(httpText: string, options: Options = {}): ConvertResult 
   if (/[\[\]{}]/.test(pathAndQuery)) {
     args.push(opt('--globoff', '-g'));
     warnings.push(
-      'URL 路径/查询包含 [] 或 {}（curl glob 元字符），已追加 --globoff 按字面发送（不做百分号编码，保持 wire format 不变）',
+      'URL path/query contains [] or {} (curl glob metacharacters); added --globoff to send them literally (not percent-encoded, wire format unchanged)',
     );
   }
   if (asteriskForm) {
     args.push('--request-target', q('*'));
     warnings.push(
-      '请求行为 asterisk-form（OPTIONS *），已用 --request-target 保持线上形态（需 curl ≥ 7.55）',
+      'request line is asterisk-form (OPTIONS *); using --request-target to preserve the wire form (requires curl >= 7.55)',
     );
   }
   args.push(q(url));
+
+  // PowerShell 方言 + 参数值含双引号：生成的命令语法正确，但 Windows PowerShell 5.1
+  // 向原生程序传参时不转义参数内嵌的 "（PSNativeCommandArgumentPassing 7.3 才修复），
+  // 含 " 的参数（如 JSON body）会被拆碎/丢引号。照常生成 + warning 提醒需 7.3+。
+  if (opts.shell === 'powershell' && args.slice(1).some((a) => a.includes('"'))) {
+    warnings.push(
+      'argument value contains double quotes: Windows PowerShell 5.1 mangles such arguments when invoking native executables; run this command under PowerShell 7.3+ (pwsh)',
+    );
+  }
 
   return { command: args.join(' '), warnings };
 }

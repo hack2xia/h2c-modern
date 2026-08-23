@@ -8,15 +8,15 @@ Usage:
   cat request.http | h2c [options]
 
 Options:
-  -s, --short                  使用短选项（-H -b -A 等）
-  -v, --verbose                追加 --verbose
-  -a, --allow-default-headers  允许 curl 的默认请求头
-  -i, --same-http-version      输出 --http1.1 / --http2
-      --http                   使用 http:// 而非 https://
-      --shell <sh|powershell>  输出引号方言（默认 sh；powershell 档输出 curl.exe）
-  -h, --help                   显示帮助
+  -s, --short                  use short options (-H -b -A etc.)
+  -v, --verbose                append --verbose
+  -a, --allow-default-headers  allow curl's default request headers
+  -i, --same-http-version      emit --http1.1 / --http2
+      --http                   use http:// instead of https://
+      --shell <sh|powershell>  quoting dialect (default sh; powershell emits curl.exe)
+  -h, --help                   show this help
 
-读取一段 HTTP 请求报文，输出对应的 curl 命令行。`;
+Reads a raw HTTP request message and prints the equivalent curl command line.`;
 
 const opts: Options = {};
 const files: string[] = [];
@@ -47,7 +47,7 @@ for (let i = 0; i < Deno.args.length; i++) {
       const v = Deno.args[++i];
       if (v !== 'sh' && v !== 'powershell') {
         console.error(
-          `h2c: --shell 需要 sh 或 powershell，得到 '${v ?? ''}'\n\n${USAGE}`,
+          `h2c: --shell expects sh or powershell, got '${v ?? ''}'\n\n${USAGE}`,
         );
         Deno.exit(1);
       }

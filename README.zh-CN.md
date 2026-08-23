@@ -5,6 +5,8 @@
 这是 [curl/h2c](https://github.com/curl/h2c)（原 Perl 脚本）的现代重写版：核心逻辑用 TypeScript
 写成纯函数，CLI 与 Web 共享同一份实现，Web 端转换在浏览器本地完成（数据不上传）。
 
+[English README](README.md)
+
 ## 技术栈
 
 - **核心**：TypeScript 纯函数（`convert.ts`），无 IO 依赖
@@ -33,11 +35,13 @@ h2c-modern/
 │   ├── 05_cookie_gzip.*
 │   ├── 06_multipart.*
 │   ├── 07_urlencoded.*
-│   └── 08_bearer.*
+│   ├── 08_bearer.*
+│   └── 09_post_no_ct.*
 ├── _build/              # 构建产物（gitignore）
 │   ├── convert.mjs      # esbuild 打包生成，供前端 import
 │   └── h2c              # deno compile 生成的独立二进制
-└── README.md
+├── README.md            # 英文文档
+└── README.zh-CN.md      # 中文文档
 ```
 
 ## 安装 Deno
@@ -89,6 +93,10 @@ deno task build
 > PowerShell 切换）生成 PowerShell 兼容的引号方言：内嵌单引号按 `''` 翻倍转义，程序名输出为
 > `curl.exe`——避开 Windows PowerShell 5.1 把裸 `curl` 别名到 Invoke-WebRequest 的问题。cmd
 > 不支持（单引号不是引用字符，含 `&` 的 URL 会被拆成 两条命令执行）。
+>
+> 注意：PowerShell 档需 **PowerShell 7.3+**。Windows PowerShell 5.1 向原生程序传参时不转义参数
+> 内嵌的双引号（`PSNativeCommandArgumentPassing` 到 7.3 才默认修复），含 `"` 的参数（如 JSON
+> body）会被拆碎。检测到此类参数时会追加 warning 提醒。
 
 ### Web
 
@@ -144,10 +152,11 @@ docker run -d -p 8080:80 --name h2c h2c-modern
 **总原则**：请求有**明显错误** → 拒绝转换并指出错误；请求**可能有问题** → 照常生成命令， 但以非阻断
 warning 提醒（CLI 走 stderr 不影响管道，Web 显示在输出区下方，不参与复制）。
 
-拒绝（明显错误 / 无法忠实表达）：空请求、请求行不是 `METHOD target [HTTP/x]` 两到三段、 无冒号的
-header 行、缺 `Host`（absolute-form 除外）、多个 `Host`、值不同的重复
-`Content-Length`（请求走私特征）、`Transfer-Encoding: chunked`、multipart 无法解析、
-请求体含二进制/非 UTF-8 字节（U+FFFD 替换字符）、`CONNECT`（代理隧道控制报文）。
+拒绝（明显错误 / 无法忠实表达）：空请求、请求行不是 `METHOD target [HTTP/x]` 两到三段、 非法
+request-target 形态（不以 `/` 开头且非 absolute-form / asterisk-form，如裸 `foo` 或非 CONNECT 的
+authority-form；asterisk-form 仅限 `OPTIONS`）、 无冒号的 header 行、缺 `Host`（absolute-form
+除外）、 多个 `Host`、值不同的重复 `Content-Length`（请求走私特征）、`Transfer-Encoding: chunked`、
+multipart 无法解析、请求体含二进制/非 UTF-8 字节（U+FFFD 替换字符）、`CONNECT`（代理隧道控制报文）。
 
 生成 + warning（可能有问题）：absolute-form 请求行（直接使用其中 URL；与 `Host` 不一致时
 追加提醒）、obs-fold 折叠头（按 RFC 展开）、`OPTIONS *` 的 asterisk-form 请求行（用
@@ -159,7 +168,8 @@ flag）、URL 含非 ASCII 字符（按 UTF-8 百分号编码）、 Basic 凭据
 `HEAD` 带 body（curl 的 `--data-binary` 会把方法切成 POST、 `--head` 与 body 互斥，故追加
 `--request GET` / `--request HEAD` 保持方法，部分服务器/代理会拒绝）、 URL 路径/查询含 `{}` /
 `[]`（curl 默认把这类字符当 glob 展开：`{a,b}` 会发多个请求、`[abc]` 直接报错；追加 `--globoff`
-按字面发送，不做百分号编码，保持 wire format 不变）。
+按字面发送，不做百分号编码，保持 wire format 不变）、PowerShell 方言下参数值含双引号（Windows
+PowerShell 5.1 向原生程序传参会破坏此类参数，命令需 PowerShell 7.3+）。
 
 - **方法**：`HEAD` → `--head`；`GET` → 默认；`POST` → `--data-binary`；其它 → `--request`
 - **请求体**：普通 → `--data-binary`；声明 `Content-Length: 0` 的无 body 请求（POST/PUT 等） →
@@ -205,7 +215,8 @@ shell 传递。检测到请求体含 U+FFFD 替换字符时会**拒绝转换** �
 - `CONNECT` 是代理隧道控制报文，单条 curl 命令无法表达隧道语义，**拒绝转换** （复现流量应使用
   `--proxy` 系列选项）。
 - `OPTIONS * HTTP/1.1` 的 asterisk-form 用 `--request-target '*'` 原样发送 target （URL 只承载
-  authority），并附 warning（需 curl ≥ 7.55）。
+  authority），并附 warning（需 curl ≥ 7.55）。asterisk-form 仅对 `OPTIONS` 方法合法，其它方法 带
+  `*` target 直接拒绝。
 
 ### multipart `--form` 行为说明
 
