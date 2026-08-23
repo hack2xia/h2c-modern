@@ -83,6 +83,17 @@ function parse(input: string): ParseResult {
     throw new Error('empty request');
   }
 
+  // 裸 CR 检测：上面的行切分已消费全部合法 CRLF，任何行里残留的 \r 都是非法字节
+  // （RFC 7230：CR 仅允许作为 CRLF 的组成部分）。静默透传会生成含不可见 CR 的
+  // 命令，且裸 CR 是经典的请求走私向量，明确拒绝
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].includes('\r')) {
+      throw new Error(
+        `bare CR in line ${i + 1}: CR is only valid as part of CRLF; refusing to convert`,
+      );
+    }
+  }
+
   const requestLine = lines[0].trim();
   const parts = requestLine.split(/\s+/);
   // 请求行必须是 "METHOD target [HTTP/x]" 两到三段：
@@ -208,7 +219,8 @@ function isMultipart(req: ParsedRequest): boolean {
 }
 
 /** 解析 multipart body，返回 --form 的参数列表（不含选项名）
- * @throws 缺 boundary 或解析不出任何 part 时抛 ConvertWarning——
+ * @throws 缺 boundary、解析不出任何 part、part 缺 Content-Disposition、
+ *   或 part 被截断（有 CD 但无 header/body 空行）时抛 ConvertWarning——
  *   静默输出会丢失请求体语义，宁可拒绝并提示用户检查原始请求。
  */
 function parseMultipart(req: ParsedRequest): string[] {
@@ -239,7 +251,16 @@ function parseMultipart(req: ParsedRequest): string[] {
       sep = part.indexOf('\n\n');
       sepLen = 2;
     }
-    if (sep === -1) continue;
+    if (sep === -1) {
+      // 无 header/body 空行：MIME 允许 boundary 前后存在应忽略的 preamble/epilogue；
+      // 但含 Content-Disposition 的是被截断的真实 part，静默跳过会丢数据，拒绝
+      if (/Content-Disposition:/i.test(part)) {
+        throw new ConvertWarning(
+          'multipart part looks truncated (Content-Disposition present but no blank line before its body); refusing to convert rather than silently dropping it. Check that the original request is complete.',
+        );
+      }
+      continue;
+    }
 
     const partHeaders = part.slice(0, sep);
     const partBody = part.slice(sep + sepLen);
@@ -247,16 +268,28 @@ function parseMultipart(req: ParsedRequest): string[] {
     const cdMatch = partHeaders.match(
       /Content-Disposition:\s*form-data;[^\r\n]*/i,
     );
-    if (!cdMatch) continue;
+    if (!cdMatch) {
+      // 静默跳过会丢数据（原版 h2c 在此处同样报错），拒绝
+      throw new ConvertWarning(
+        'multipart part is missing its Content-Disposition header; refusing to convert rather than silently dropping it. Check that the original request is complete.',
+      );
+    }
     const cd = cdMatch[0];
     const nameMatch = cd.match(/name="([^"]*)"/i);
     const fileMatch = cd.match(/filename="([^"]*)"/i);
     const name = nameMatch ? nameMatch[1] : '';
 
+    // part 级 Content-Type 保留为 ;type=：否则 curl 按文件扩展名猜或退回
+    // application/octet-stream，改变 wire format。含参数值（如 "text/plain;
+    // charset=utf-8"）直接原样拼接即可，curl 会完整发送（实测验证，勿加引号）
+    const ctLine = partHeaders.split(/\r\n|\n/).find((l) => /^Content-Type:/i.test(l));
+    const partCT = ctLine?.replace(/^Content-Type:[ \t]*/i, '').replace(/[ \t]+$/, '');
+    const typeSuffix = partCT ? `;type=${partCT}` : '';
+
     if (fileMatch) {
-      forms.push(`${name}=@${fileMatch[1]}`);
+      forms.push(`${name}=@${fileMatch[1]}${typeSuffix}`);
     } else {
-      forms.push(`${name}=${partBody}`);
+      forms.push(`${name}=${partBody}${typeSuffix}`);
     }
   }
 
@@ -404,9 +437,24 @@ export function convert(httpText: string, options: Options = {}): ConvertResult 
             `Content-Length declares ${declared} bytes but the body is only ${actual} bytes — the body may be truncated; check the original request (curl will send the actual length)`,
           );
         } else {
-          warnings.push(
-            `Content-Length declares ${declared} bytes but the body is ${actual} bytes — inconsistent; curl will send the actual length`,
-          );
+          // 多出的字节恰好是一段结尾换行：大概率是粘贴文本自带的末尾换行，专门提示
+          // （无 CL 头时无法区分真实 body 换行与粘贴产物，不提示）
+          let trailing = 0;
+          if (req.body.endsWith('\r\n')) trailing = 2;
+          else if (req.body.endsWith('\n')) trailing = 1;
+          if (
+            trailing > 0 && declared === actual - trailing
+          ) {
+            warnings.push(
+              `Content-Length declares ${declared} bytes but the body is ${actual} bytes; the extra ${
+                trailing === 1 ? 'byte is a trailing LF' : 'bytes are a trailing CRLF'
+              } — likely just the final newline of the pasted input. curl will send it as part of the body; delete the trailing newline if that is not intended`,
+            );
+          } else {
+            warnings.push(
+              `Content-Length declares ${declared} bytes but the body is ${actual} bytes — inconsistent; curl will send the actual length`,
+            );
+          }
         }
       }
     }

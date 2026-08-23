@@ -171,6 +171,103 @@ Deno.test('multipart: 无任何 part 抛 ConvertWarning', () => {
   assertThrows(() => convert(input), ConvertWarning, 'part');
 });
 
+// part 缺 Content-Disposition：拒绝而不是静默跳过（静默跳过会丢数据，原版 h2c 同样报错）
+Deno.test('multipart: part 缺 Content-Disposition 拒绝', () => {
+  const input = [
+    'POST /upload HTTP/1.1',
+    'Host: example.com',
+    'Content-Type: multipart/form-data; boundary=xyz',
+    '',
+    '--xyz',
+    'X-Other: header-only',
+    '',
+    'data',
+    '--xyz--',
+    '',
+  ].join('\r\n');
+  assertThrows(() => convert(input), ConvertWarning, 'Content-Disposition');
+});
+
+// part 有 Content-Disposition 但无空行（截断的报文）：拒绝而不是静默跳过
+Deno.test('multipart: 截断 part 拒绝', () => {
+  const input = [
+    'POST /upload HTTP/1.1',
+    'Host: example.com',
+    'Content-Type: multipart/form-data; boundary=xyz',
+    '',
+    '--xyz',
+    'Content-Disposition: form-data; name="a"',
+    '--xyz--',
+    '',
+  ].join('\r\n');
+  assertThrows(() => convert(input), ConvertWarning, 'truncated');
+});
+
+// part 级 Content-Type 保留为 --form 的 ;type=（否则 curl 按扩展名猜/退回
+// octet-stream，改变 wire format）
+Deno.test('multipart: 文件 part 的 Content-Type 保留为 ;type=', () => {
+  const input = [
+    'POST /upload HTTP/1.1',
+    'Host: example.com',
+    'Content-Type: multipart/form-data; boundary=xyz',
+    '',
+    '--xyz',
+    'Content-Disposition: form-data; name="file"; filename="a.pdf"',
+    'Content-Type: application/pdf',
+    '',
+    '%PDF-1.4',
+    '--xyz--',
+    '',
+  ].join('\r\n');
+  assertEquals(
+    convert(input).command,
+    "curl --header 'User-Agent:' --header 'Accept:' --form 'file=@a.pdf;type=application/pdf' 'https://example.com/upload'",
+  );
+});
+
+// 带参数的 part Content-Type 原样保留（curl 对 ;type=text/plain; charset=utf-8
+// 不加引号拼接时会完整发送，实测验证）
+Deno.test('multipart: 带参数的 Content-Type 原样保留', () => {
+  const input = [
+    'POST /upload HTTP/1.1',
+    'Host: example.com',
+    'Content-Type: multipart/form-data; boundary=xyz',
+    '',
+    '--xyz',
+    'Content-Disposition: form-data; name="file"; filename="a.txt"',
+    'Content-Type: text/plain; charset=utf-8',
+    '',
+    'hello',
+    '--xyz--',
+    '',
+  ].join('\r\n');
+  assertEquals(
+    convert(input).command,
+    "curl --header 'User-Agent:' --header 'Accept:' --form 'file=@a.txt;type=text/plain; charset=utf-8' 'https://example.com/upload'",
+  );
+});
+
+// 值字段声明的 Content-Type 同样保留
+Deno.test('multipart: 值字段 Content-Type 同样保留', () => {
+  const input = [
+    'POST /upload HTTP/1.1',
+    'Host: example.com',
+    'Content-Type: multipart/form-data; boundary=xyz',
+    '',
+    '--xyz',
+    'Content-Disposition: form-data; name="json"',
+    'Content-Type: application/json',
+    '',
+    '{"a":1}',
+    '--xyz--',
+    '',
+  ].join('\r\n');
+  assertEquals(
+    convert(input).command,
+    "curl --header 'User-Agent:' --header 'Accept:' --form 'json={\"a\":1};type=application/json' 'https://example.com/upload'",
+  );
+});
+
 // 重复 Cookie 头：逐条透传为 -H，保持 wire format（安全工具常故意构造重复头，
 // 合并为 "; " 会改变线上字节；且 -H 'Cookie:' 会抑制 -b，不能混用）
 Deno.test('dup headers: 多个 Cookie 逐条透传', () => {
@@ -706,6 +803,57 @@ Deno.test('warn: Content-Length 小于 body 字节数', () => {
   if (!/Content-Length/.test(result.warnings[0])) {
     throw new Error(`unexpected warning: ${result.warnings[0]}`);
   }
+});
+
+// 多出的字节恰好是一段结尾换行：大概率是粘贴文本的末尾换行，专门提示
+Deno.test('warn: 结尾 LF 恰好抵消 CL 差值时提示粘贴换行', () => {
+  const result = convert(
+    'POST /api HTTP/1.1\nHost: example.com\nContent-Length: 5\n\nhello\n',
+  );
+  assertEquals(result.warnings.length, 1);
+  if (!/trailing LF/.test(result.warnings[0])) {
+    throw new Error(`unexpected warning: ${result.warnings[0]}`);
+  }
+});
+
+Deno.test('warn: 结尾 CRLF 恰好抵消 CL 差值时提示粘贴换行', () => {
+  const result = convert(
+    'POST /api HTTP/1.1\r\nHost: example.com\r\nContent-Length: 5\r\n\r\nhello\r\n',
+  );
+  assertEquals(result.warnings.length, 1);
+  if (!/trailing CRLF/.test(result.warnings[0])) {
+    throw new Error(`unexpected warning: ${result.warnings[0]}`);
+  }
+});
+
+// 多出的字节不是换行形态：维持通用不一致提示
+Deno.test('warn: 多出字节非换行时维持通用提示', () => {
+  const result = convert(
+    'POST /api HTTP/1.1\nHost: example.com\nContent-Length: 5\n\nhello!!',
+  );
+  assertEquals(result.warnings.length, 1);
+  if (!/inconsistent/.test(result.warnings[0])) {
+    throw new Error(`unexpected warning: ${result.warnings[0]}`);
+  }
+});
+
+// ===== 裸 CR（非 CRLF 组成部分）：拒绝，不生成含不可见 CR 的命令 =====
+
+Deno.test('error: header 行含裸 CR 拒绝', () => {
+  assertThrows(
+    () => convert('GET / HTTP/1.1\nHost: h\rX-A: v\n'),
+    Error,
+    'bare CR',
+  );
+});
+
+// 请求行里的裸 CR 若与空格相邻会被 split(/\s+/) 静默吞掉（path 被改变），也要拒绝
+Deno.test('error: 请求行含裸 CR 拒绝', () => {
+  assertThrows(
+    () => convert('GET /a \r HTTP/1.1\nHost: h\n'),
+    Error,
+    'bare CR',
+  );
 });
 
 Deno.test('ok: Content-Length 与 body 字节数一致无 warning', () => {
