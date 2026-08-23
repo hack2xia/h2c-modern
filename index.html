@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="en">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -10,13 +10,13 @@
     <header>
       <span class="mark">h2c</span>
       <span class="title">headers to curl</span>
-      <span class="sub">HTTP 请求 → curl 命令，本地转换</span>
+      <span class="sub">HTTP request → curl command, converted locally</span>
     </header>
 
     <main>
       <div class="panels">
         <div class="panel req">
-          <label><span class="dot"></span>HTTP 请求</label>
+          <label><span class="dot"></span>HTTP request</label>
           <textarea
             id="input"
             spellcheck="false"
@@ -26,7 +26,7 @@ Host: example.com
           ></textarea>
         </div>
         <div class="panel res">
-          <label><span class="dot"></span>curl 命令</label>
+          <label><span class="dot"></span>curl command</label>
           <pre id="output"></pre>
           <div id="warnings" hidden></div>
         </div>
@@ -35,7 +35,7 @@ Host: example.com
       <div class="controls">
         <label class="chip">
           <input type="checkbox" id="opt-short" />
-          <span class="tick"></span>短选项
+          <span class="tick"></span>Short options
         </label>
         <label class="chip">
           <input type="checkbox" id="opt-verbose" />
@@ -43,11 +43,11 @@ Host: example.com
         </label>
         <label class="chip">
           <input type="checkbox" id="opt-default" />
-          <span class="tick"></span>允许默认头
+          <span class="tick"></span>Default headers
         </label>
         <label class="chip">
           <input type="checkbox" id="opt-version" />
-          <span class="tick"></span>HTTP 版本
+          <span class="tick"></span>HTTP version
         </label>
         <label class="chip">
           <input type="checkbox" id="opt-http" />
@@ -61,16 +61,16 @@ Host: example.com
           <input type="radio" name="opt-shell" value="powershell" />
           <span class="tick"></span>PowerShell
         </label>
-        <button id="copy" type="button">复制</button>
+        <button id="copy" type="button">Copy</button>
       </div>
     </main>
 
     <footer>
-      转换在浏览器本地完成，数据不上传 · <a
+      Conversion runs locally in your browser — nothing is uploaded · <a
         href="https://github.com/curl/h2c"
         target="_blank"
         rel="noopener"
-      >原始项目</a>
+      >Original project</a>
     </footer>
 
     <script type="module">
@@ -124,8 +124,8 @@ Host: example.com
     copy.addEventListener('click', async () => {
       try {
         await navigator.clipboard.writeText(output.textContent);
-        copy.textContent = '已复制';
-        setTimeout(() => (copy.textContent = '复制'), 1500);
+        copy.textContent = 'Copied';
+        setTimeout(() => (copy.textContent = 'Copy'), 1500);
       } catch {
         /* 剪贴板不可用时静默 */
       }
