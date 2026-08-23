@@ -85,9 +85,10 @@ deno task build
 
 ## 使用
 
-> **输出面向 POSIX shell**（bash/zsh/sh，引号按 `'\''` 转义）。Windows 下不保证兼容： cmd
-> 不把单引号当引用（含 `&` 的 URL 会被拆成两条命令执行）；PowerShell 可执行大部分
-> 命令，但数据含撇号时 `'\''` 转义会失效。Windows 用户建议在 WSL / Git Bash 中运行。
+> 输出默认面向 POSIX shell（bash/zsh/sh，引号按 `'\''` 转义）。`--shell powershell` （Web 端为 sh /
+> PowerShell 切换）生成 PowerShell 兼容的引号方言：内嵌单引号按 `''` 翻倍转义，程序名输出为
+> `curl.exe`——避开 Windows PowerShell 5.1 把裸 `curl` 别名到 Invoke-WebRequest 的问题。cmd
+> 不支持（单引号不是引用字符，含 `&` 的 URL 会被拆成 两条命令执行）。
 
 ### Web
 
@@ -129,13 +130,14 @@ docker run -d -p 8080:80 --name h2c h2c-modern
 
 ## 选项
 
-| 选项（CLI）                   | Web            | 说明                                    |
-| ----------------------------- | -------------- | --------------------------------------- |
-| `-s, --short`                 | 使用短选项     | `-H` `-b` `-A` `-u` `-I` `-X` `-v` `-F` |
-| `-v, --verbose`               | verbose        | 追加 `--verbose`                        |
-| `-a, --allow-default-headers` | 允许默认请求头 | 不抑制 `Accept` / `User-Agent`          |
-| `-i, --same-http-version`     | 输出 HTTP 版本 | 追加 `--http1.1` / `--http2`            |
-| `--http`                      | 使用 http://   | 默认 https://                           |
+| 选项（CLI）                   | Web                  | 说明                                          |
+| ----------------------------- | -------------------- | --------------------------------------------- |
+| `-s, --short`                 | 使用短选项           | `-H` `-b` `-A` `-u` `-I` `-X` `-v` `-F`       |
+| `-v, --verbose`               | verbose              | 追加 `--verbose`                              |
+| `-a, --allow-default-headers` | 允许默认请求头       | 不抑制 `Accept` / `User-Agent`                |
+| `-i, --same-http-version`     | 输出 HTTP 版本       | 追加 `--http1.1` / `--http2`                  |
+| `--http`                      | 使用 http://         | 默认 https://                                 |
+| `--shell <sh\|powershell>`    | sh / PowerShell 切换 | 引号方言，默认 sh；powershell 档用 `curl.exe` |
 
 ## 转换规则
 

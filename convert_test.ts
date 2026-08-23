@@ -789,3 +789,42 @@ Deno.test('warn: asterisk-form 用 --request-target 保持线上形态', () => {
     throw new Error(`unexpected warning: ${result.warnings[0]}`);
   }
 });
+
+// ===== shell=powershell：引号方言切换 =====
+
+// PS 单引号串内撇号按 '' 翻倍转义（sh 是 '\''）；程序名用 curl.exe 避开
+// Windows PowerShell 5.1 的 Invoke-WebRequest 别名
+Deno.test('shell: powershell 撇号翻倍 + curl.exe', () => {
+  const result = convert(
+    "POST /a HTTP/1.1\nHost: example.com\nContent-Type: text/plain\n\nit's ok",
+    { shell: 'powershell' },
+  );
+  assertEquals(
+    result.command,
+    "curl.exe --header 'User-Agent:' --header 'Accept:' --header 'Content-Type: text/plain' --data-binary 'it''s ok' 'https://example.com/a'",
+  );
+  assertEquals(result.warnings, []);
+});
+
+Deno.test('shell: powershell header 撇号同样翻倍', () => {
+  const result = convert("GET / HTTP/1.1\nHost: example.com\nX-Msg: don't\n", {
+    shell: 'powershell',
+  });
+  assertEquals(
+    result.command,
+    "curl.exe --header 'User-Agent:' --header 'Accept:' --header 'X-Msg: don''t' 'https://example.com/'",
+  );
+  assertEquals(result.warnings, []);
+});
+
+// 默认（不传 shell）仍是 POSIX 方言：'\'' 转义 + 裸 curl
+Deno.test('shell: 默认 sh 方言回归', () => {
+  const result = convert(
+    "POST /a HTTP/1.1\nHost: example.com\nContent-Type: text/plain\n\nit's ok",
+  );
+  assertEquals(
+    result.command,
+    "curl --header 'User-Agent:' --header 'Accept:' --header 'Content-Type: text/plain' --data-binary 'it'\\''s ok' 'https://example.com/a'",
+  );
+  assertEquals(result.warnings, []);
+});

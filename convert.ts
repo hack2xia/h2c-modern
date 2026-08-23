@@ -1,6 +1,9 @@
 // h2c-modern: headers to curl —— 核心转换逻辑（纯函数，无 IO 依赖）
 // 输入一段原始 HTTP 请求报文，输出对应的 curl 命令行。
 
+/** 输出目标的 shell 引号方言 */
+export type ShellTarget = 'sh' | 'powershell';
+
 /** 转换选项 */
 export interface Options {
   /** 使用短选项（-H / -b / -A / -u / -I / -X / -v / -F），默认 false */
@@ -13,6 +16,12 @@ export interface Options {
   sameHttpVersion?: boolean;
   /** 使用 http:// 而非 https://，默认 false */
   useHttp?: boolean;
+  /**
+   * 输出引号方言：sh（POSIX，内嵌单引号按 '\'' 转义）或 powershell（单引号串内
+   * 按 '' 翻倍转义），默认 sh。两种方言下其余生成逻辑完全一致——curl 的选项语法
+   * 与目标 shell 无关。
+   */
+  shell?: ShellTarget;
 }
 
 interface Header {
@@ -270,8 +279,15 @@ export function convert(httpText: string, options: Options = {}): ConvertResult 
     allowDefaultHeaders: false,
     sameHttpVersion: false,
     useHttp: false,
+    shell: 'sh' as ShellTarget,
     ...options,
   };
+
+  // 引号方言分发：两种 shell 的单引号串都除引号字符外全字面，差异只在转义习语——
+  // POSIX 用 '\''（闭合、转义引号、重开），PowerShell 用 ''（翻倍）。
+  const q = opts.shell === 'powershell'
+    ? (s: string): string => "'" + s.replaceAll("'", "''") + "'"
+    : shQuote;
 
   const { req, warnings } = parse(httpText);
   const method = req.method.toUpperCase();
@@ -393,7 +409,10 @@ export function convert(httpText: string, options: Options = {}): ConvertResult 
   }
 
   const multipart = isMultipart(req);
-  const args: string[] = ['curl'];
+  // powershell 档用 curl.exe：Windows PowerShell 5.1 把裸 curl 别名到 Invoke-WebRequest，
+  // 会把整条命令喂给错误的 cmdlet；curl.exe 在 Windows PowerShell 与 pwsh 下都直指真 curl。
+  // （pwsh on Linux/macOS 无此别名，但该档位面向 Windows 用户。）
+  const args: string[] = [opts.shell === 'powershell' ? 'curl.exe' : 'curl'];
 
   const opt = (long: string, short: string): string => opts.shortOpt ? short : long;
 
@@ -448,7 +467,7 @@ export function convert(httpText: string, options: Options = {}): ConvertResult 
   if (uaValues.length === 1) {
     const ua = uaValues[0];
     if (isStandardOWS(ua)) {
-      args.push(opt('--user-agent', '-A'), shQuote(stripStandardOWS(ua)));
+      args.push(opt('--user-agent', '-A'), q(stripStandardOWS(ua)));
     } else {
       warnings.push(
         'User-Agent 头含非标准 OWS（前导多空格/HTAB/后导空白），已原样透传为 -H 以保持 wire format',
@@ -461,7 +480,7 @@ export function convert(httpText: string, options: Options = {}): ConvertResult 
   if (cookieValues.length === 1) {
     const cookie = cookieValues[0];
     if (isStandardOWS(cookie)) {
-      args.push(opt('--cookie', '-b'), shQuote(stripStandardOWS(cookie)));
+      args.push(opt('--cookie', '-b'), q(stripStandardOWS(cookie)));
     } else {
       warnings.push(
         'Cookie 头含非标准 OWS（前导多空格/HTAB/后导空白），已原样透传为 -H 以保持 wire format',
@@ -530,10 +549,10 @@ export function convert(httpText: string, options: Options = {}): ConvertResult 
   // 默认头抑制
   if (!opts.allowDefaultHeaders) {
     if (uaValues.length === 0) {
-      args.push(opt('--header', '-H'), shQuote('User-Agent:'));
+      args.push(opt('--header', '-H'), q('User-Agent:'));
     }
     if (getHeader(req.headers, 'accept') === undefined) {
-      args.push(opt('--header', '-H'), shQuote('Accept:'));
+      args.push(opt('--header', '-H'), q('Accept:'));
     }
   }
 
@@ -542,7 +561,7 @@ export function convert(httpText: string, options: Options = {}): ConvertResult 
     if (alwaysSkip.has(key) || consumed.has(key)) continue;
     // 不插入空格：value 已原样保留冒号后所有字节（含前导 OWS），
     // 由 curl 直接发送 `-H 'Name: value'` / `-H 'Name:value'` / `-H 'Name:  value'` 等形态。
-    args.push(opt('--header', '-H'), shQuote(`${h.name}:${h.value}`));
+    args.push(opt('--header', '-H'), q(`${h.name}:${h.value}`));
   }
 
   // 9. 请求体
@@ -562,14 +581,14 @@ export function convert(httpText: string, options: Options = {}): ConvertResult 
     clValues.every((v) => /^\d+$/.test(v.trim()) && Number(v.trim()) === 0);
   if (multipart) {
     for (const f of parseMultipart(req)) {
-      args.push(opt('--form', '-F'), shQuote(f));
+      args.push(opt('--form', '-F'), q(f));
     }
   } else if (req.body) {
     suppressDefaultCT();
-    args.push('--data-binary', shQuote(req.body));
+    args.push('--data-binary', q(req.body));
   } else if (declaredZeroBody) {
     suppressDefaultCT();
-    args.push('--data-binary', shQuote(''));
+    args.push('--data-binary', q(''));
   } else if (method === 'POST') {
     // POST 无 body 且未声明 CL:0：用 --request POST 明确方法，避免 --data-binary ''
     // 注入原请求没有的 Content-Length: 0。
@@ -602,12 +621,12 @@ export function convert(httpText: string, options: Options = {}): ConvertResult 
     );
   }
   if (asteriskForm) {
-    args.push('--request-target', shQuote('*'));
+    args.push('--request-target', q('*'));
     warnings.push(
       '请求行为 asterisk-form（OPTIONS *），已用 --request-target 保持线上形态（需 curl ≥ 7.55）',
     );
   }
-  args.push(shQuote(url));
+  args.push(q(url));
 
   return { command: args.join(' '), warnings };
 }
