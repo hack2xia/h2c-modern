@@ -136,16 +136,19 @@ docker run -d -p 8080:80 --name h2c h2c-modern
 浏览器打开 `http://localhost:8080`。多阶段构建：builder 阶段用 Deno 打包前端模块，runtime 阶段用
 `nginx:alpine` 托管静态文件，最终镜像不含运行时。
 
+CI 会构建镜像并对运行中的容器做冒烟测试——页面、静态资源、以及 `.mjs` 的 MIME 类型 （最后这项正是
+`mime.types` 补丁存在的意义；补丁失效只有真实请求一次才能暴露——那时 浏览器会拒绝加载 ES module）。
+
 ## 选项
 
-| 选项（CLI）                   | Web                  | 说明                                          |
-| ----------------------------- | -------------------- | --------------------------------------------- |
-| `-s, --short`                 | 使用短选项           | `-H` `-b` `-A` `-u` `-I` `-X` `-v` `-F`       |
-| `-v, --verbose`               | verbose              | 追加 `--verbose`                              |
-| `-a, --allow-default-headers` | 允许默认请求头       | 不抑制 `Accept` / `User-Agent`                |
-| `-i, --same-http-version`     | 输出 HTTP 版本       | 追加 `--http1.1` / `--http2`                  |
-| `--http`                      | 使用 http://         | 默认 https://                                 |
-| `--shell <sh\|powershell>`    | sh / PowerShell 切换 | 引号方言，默认 sh；powershell 档用 `curl.exe` |
+| 选项（CLI）                   | Web             | 说明                                          |
+| ----------------------------- | --------------- | --------------------------------------------- |
+| `-s, --short`                 | Short options   | `-H` `-b` `-A` `-u` `-I` `-X` `-v` `-F`       |
+| `-v, --verbose`               | verbose         | 追加 `--verbose`                              |
+| `-a, --allow-default-headers` | Default headers | 不抑制 `Accept` / `User-Agent`                |
+| `-i, --same-http-version`     | HTTP version    | 追加 `--http1.1` / `--http2`                  |
+| `--http`                      | http://         | 默认 https://                                 |
+| `--shell <sh\|powershell>`    | sh / PowerShell | 引号方言，默认 sh；powershell 档用 `curl.exe` |
 
 ## 转换规则
 
@@ -154,20 +157,23 @@ warning 提醒（CLI 走 stderr 不影响管道，Web 显示在输出区下方�
 
 拒绝（明显错误 / 无法忠实表达）：空请求、请求行不是 `METHOD target [HTTP/x]` 两到三段、 非法
 request-target 形态（不以 `/` 开头且非 absolute-form / asterisk-form，如裸 `foo` 或非 CONNECT 的
-authority-form；asterisk-form 仅限 `OPTIONS`）、 无冒号的 header 行、缺 `Host`（absolute-form
-除外）、 多个 `Host`、值不同的重复 `Content-Length`（请求走私特征）、`Transfer-Encoding: chunked`、
-multipart 无法解析、请求体含二进制/非 UTF-8 字节（U+FFFD 替换字符）、`CONNECT`（代理隧道控制报文）。
+authority-form；asterisk-form 仅限 `OPTIONS`）、 无冒号的 header 行、header 区含裸 CR（CR 仅可 作为
+CRLF 的组成部分，属请求走私向量）、缺 `Host`（absolute-form 除外）、 多个 `Host`、值不同的重复
+`Content-Length`（请求走私特征）、`Transfer-Encoding: chunked`、 multipart 无法解析（缺
+boundary、解析不出 part、part 缺 Content-Disposition 或被截断）、请求体含二进制/非 UTF-8
+字节（U+FFFD 替换字符）、`CONNECT`（代理隧道控制报文）。
 
 生成 + warning（可能有问题）：absolute-form 请求行（直接使用其中 URL；与 `Host` 不一致时
 追加提醒）、obs-fold 折叠头（按 RFC 展开）、`OPTIONS *` 的 asterisk-form 请求行（用
 `--request-target` 原样发送 target，需 curl ≥ 7.55）、值相同的重复 `Content-Length`（忽略）、
 `Content-Length` 与 body 实际字节数不一致（声明大于实际时提示请求体可能被截断；curl 会按实际长度
-重算）、`Content-Length` 值非数字（curl 自动按 body 计算）、`-i` 遇到未识别的 HTTP 版本（不输出
-flag）、URL 含非 ASCII 字符（按 UTF-8 百分号编码）、 Basic 凭据解码后含非 ASCII 字节（超出
-`user:password` 常规范围；RFC 7617 未规定编码， 不猜测编码，原样透传 `Authorization` 头）、`GET` /
-`HEAD` 带 body（curl 的 `--data-binary` 会把方法切成 POST、 `--head` 与 body 互斥，故追加
-`--request GET` / `--request HEAD` 保持方法，部分服务器/代理会拒绝）、 URL 路径/查询含 `{}` /
-`[]`（curl 默认把这类字符当 glob 展开：`{a,b}` 会发多个请求、`[abc]` 直接报错；追加 `--globoff`
+重算；多出的字节恰好是一段结尾 LF/CRLF 时，warning 会明确提示这很可能只是粘贴文本的末尾换行）、
+`Content-Length` 值非数字（curl 自动按 body 计算）、`-i` 遇到未识别的 HTTP 版本（不输出 flag）、URL
+含非 ASCII 字符（按 UTF-8 百分号编码）、 Basic 凭据解码后含非 ASCII 字节（超出 `user:password`
+常规范围；RFC 7617 未规定编码， 不猜测编码，原样透传 `Authorization` 头）、`GET` / `HEAD` 带
+body（curl 的 `--data-binary` 会把方法切成 POST、 `--head` 与 body 互斥，故追加 `--request GET` /
+`--request HEAD` 保持方法，部分服务器/代理会拒绝）、 URL 路径/查询含 `{}` / `[]`（curl
+默认把这类字符当 glob 展开：`{a,b}` 会发多个请求、`[abc]` 直接报错；追加 `--globoff`
 按字面发送，不做百分号编码，保持 wire format 不变）、PowerShell 方言下参数值含双引号（Windows
 PowerShell 5.1 向原生程序传参会破坏此类参数，命令需 PowerShell 7.3+）。
 
@@ -223,7 +229,7 @@ shell 传递。检测到请求体含 U+FFFD 替换字符时会**拒绝转换** �
 `multipart/form-data` 请求被转换为多个 `--form` 参数：
 
 - 普通字段 → `name=value`
-- **带 `filename` 的字段 → `name=@filename`**
+- **带 `filename` 的字段 → `name=@filename`**（part 声明了 Content-Type 时追加 `;type=<ct>`）
 
 `@filename` 是 curl 的语法，会让 curl **从本地文件读取内容上传**，而不是发送原始请求体里的字节。
 也就是说，生成的 curl 命令依赖本地存在同名文件。若想用原始请求体里的内容，请手动把 `@filename`
@@ -231,9 +237,12 @@ shell 传递。检测到请求体含 U+FFFD 替换字符时会**拒绝转换** �
 
 这与原版 [curl/h2c](https://github.com/curl/h2c) 行为一致。
 
-若 `Content-Type` 声明了 multipart 但缺少 `boundary`，或按 boundary 解析不出任何 part, h2c
-会**拒绝转换**（warning 退出码 1 / Web 端橙色提示），而不是静默产出丢失请求体的命令。
-请检查原始请求是否完整。
+part 级 `Content-Type` 会保留为生成 `--form` 的 `;type=`；不保留的话 curl 会按文件扩展名 猜测或退回
+`application/octet-stream`，改变 wire format。
+
+若 `Content-Type` 声明了 multipart 但缺少 `boundary`、按 boundary 解析不出任何 part、某 个 part 缺少
+Content-Disposition 头、或某个 part 看起来被截断，h2c 会**拒绝转换**（warning 退出码 1 / Web
+端橙色提示），而不是静默产出丢失部分请求体的命令。请检查原始请求是否完整。
 
 ## 许可证
 
