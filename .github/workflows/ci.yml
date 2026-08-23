@@ -16,3 +16,35 @@ jobs:
       - run: deno fmt --check
       - run: deno lint
       - run: deno task test
+
+  # 构建镜像并起容器做冒烟测试：页面、静态资源、esbuild 产物可访问，
+  # 以及 .mjs 的 MIME 类型是 javascript（Dockerfile 对 nginx mime.types 的
+  # 补丁只有真实请求一次才能验证——补丁失效时浏览器会拒绝执行 ES module）
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t h2c-modern-ci .
+      - name: Run container and wait for readiness
+        run: |
+          docker run --rm -d --name h2c-ci -p 8080:80 h2c-modern-ci
+          for i in $(seq 1 30); do
+            if curl -sf -o /dev/null http://127.0.0.1:8080/; then echo ready; exit 0; fi
+            sleep 1
+          done
+          echo "container did not become ready"
+          docker logs h2c-ci
+          exit 1
+      - name: Verify page, assets and module MIME type
+        run: |
+          curl -sf http://127.0.0.1:8080/ | grep -q '<title>h2c - headers to curl</title>'
+          curl -sf -o /dev/null http://127.0.0.1:8080/style.css
+          curl -sf http://127.0.0.1:8080/_build/convert.mjs | grep -q 'ConvertWarning'
+          MIME=$(curl -sfI http://127.0.0.1:8080/_build/convert.mjs \
+            | awk -F': ' 'tolower($1)=="content-type"{print $2}' | tr -d '\r')
+          echo "convert.mjs served as: $MIME"
+          case "$MIME" in
+            *javascript*) ;;
+            *) echo "unexpected MIME type for .mjs"; docker logs h2c-ci; exit 1 ;;
+          esac
