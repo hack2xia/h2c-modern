@@ -275,6 +275,16 @@ button:active {
   transform: translateY(1px);
 }
 
+/* 错误/拒绝态下输出区是提示文案而非命令，禁用复制 */
+button:disabled,
+button:hover:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+  transform: none;
+  box-shadow: none;
+  background: var(--coral);
+}
+
 footer {
   padding: 14px 28px;
   color: var(--ink-faint);

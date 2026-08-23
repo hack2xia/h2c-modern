@@ -85,6 +85,7 @@ Host: example.com
       output.classList.remove('error', 'warning');
       warnings.hidden = true;
       warnings.textContent = '';
+      let ok = true;
       try {
         const result = convert(input.value, readOpts());
         output.textContent = result.command;
@@ -93,6 +94,7 @@ Host: example.com
           warnings.hidden = false;
         }
       } catch (e) {
+        ok = false;
         if (e instanceof ConvertWarning) {
           output.textContent = '⚠ ' + e.message;
           output.classList.add('warning');
@@ -101,6 +103,8 @@ Host: example.com
           output.classList.add('error');
         }
       }
+      // 错误/拒绝态下输出区是提示文案而非命令，禁用复制避免把提示当命令复制走
+      copy.disabled = !ok;
     }
 
     input.addEventListener('input', update);

@@ -21,6 +21,7 @@ h2c-modern/
 ├── deno.json            # 配置：tasks / lint / fmt
 ├── convert.ts           # 核心转换逻辑（纯函数）
 ├── convert_test.ts      # 测试：夹具驱动 + 选项 + 错误用例
+├── replay_test.ts       # 回放测试：生成命令真实执行，比对线上字节
 ├── cli.ts               # CLI 入口
 ├── index.html           # 前端页面
 ├── style.css            # 样式
@@ -34,7 +35,7 @@ h2c-modern/
 │   ├── 07_urlencoded.*
 │   └── 08_bearer.*
 ├── _build/              # 构建产物（gitignore）
-│   ├── convert.mjs      # deno bundle 生成，供前端 import
+│   ├── convert.mjs      # esbuild 打包生成，供前端 import
 │   └── h2c              # deno compile 生成的独立二进制
 └── README.md
 ```
@@ -62,6 +63,10 @@ deno task lint
 测试是**夹具驱动**的：`testdata/` 里每对 `.http` / `.curl`
 文件就是一条用例，测试自动遍历全部比对。新增用例只需丢两个文件，零代码改动。
 
+除夹具比对外还有**回放测试**（`replay_test.ts`）：把每个夹具生成的 curl 命令真实执行到本地
+回显服务器（127.0.0.1 随机端口，需本机装有 curl），对比实际收到的字节与原始报文——能抓住
+"命令看起来对、线上字节不对"的问题，例如 curl 对 `--data-binary` 自动注入的默认 `Content-Type`。
+
 ## 构建
 
 ```sh
@@ -79,6 +84,10 @@ deno task build
 > `node_modules`）。
 
 ## 使用
+
+> **输出面向 POSIX shell**（bash/zsh/sh，引号按 `'\''` 转义）。Windows 下不保证兼容： cmd
+> 不把单引号当引用（含 `&` 的 URL 会被拆成两条命令执行）；PowerShell 可执行大部分
+> 命令，但数据含撇号时 `'\''` 转义会失效。Windows 用户建议在 WSL / Git Bash 中运行。
 
 ### Web
 
@@ -135,11 +144,13 @@ warning 提醒（CLI 走 stderr 不影响管道，Web 显示在输出区下方�
 
 拒绝（明显错误 / 无法忠实表达）：空请求、请求行不是 `METHOD target [HTTP/x]` 两到三段、 无冒号的
 header 行、缺 `Host`（absolute-form 除外）、多个 `Host`、值不同的重复
-`Content-Length`（请求走私特征）、`Transfer-Encoding: chunked`、multipart 无法解析。
+`Content-Length`（请求走私特征）、`Transfer-Encoding: chunked`、multipart 无法解析、
+请求体含二进制/非 UTF-8 字节（U+FFFD 替换字符）、`CONNECT`（代理隧道控制报文）。
 
 生成 + warning（可能有问题）：absolute-form 请求行（直接使用其中 URL；与 `Host` 不一致时
-追加提醒）、obs-fold 折叠头（按 RFC 展开）、值相同的重复 `Content-Length`（忽略）、 `Content-Length`
-与 body 实际字节数不一致（声明大于实际时提示请求体可能被截断；curl 会按实际长度
+追加提醒）、obs-fold 折叠头（按 RFC 展开）、`OPTIONS *` 的 asterisk-form 请求行（用
+`--request-target` 原样发送 target，需 curl ≥ 7.55）、值相同的重复 `Content-Length`（忽略）、
+`Content-Length` 与 body 实际字节数不一致（声明大于实际时提示请求体可能被截断；curl 会按实际长度
 重算）、`Content-Length` 值非数字（curl 自动按 body 计算）、`-i` 遇到未识别的 HTTP 版本（不输出
 flag）、URL 含非 ASCII 字符（按 UTF-8 百分号编码）、 Basic 凭据解码后含非 ASCII 字节（超出
 `user:password` 常规范围；RFC 7617 未规定编码， 不猜测编码，原样透传 `Authorization` 头）、`GET` /
@@ -149,7 +160,9 @@ flag）、URL 含非 ASCII 字符（按 UTF-8 百分号编码）、 Basic 凭据
 按字面发送，不做百分号编码，保持 wire format 不变）。
 
 - **方法**：`HEAD` → `--head`；`GET` → 默认；`POST` → `--data-binary`；其它 → `--request`
-- **请求体**：普通 → `--data-binary`；`multipart/form-data` → 解析为多个 `--form`
+- **请求体**：普通 → `--data-binary`；声明 `Content-Length: 0` 的无 body 请求（POST/PUT 等） →
+  `--data-binary ''` 让 curl 实际发送该头（GET/HEAD 除外——会改变方法/与 `--head` 冲突，
+  维持不发）；`multipart/form-data` → 解析为多个 `--form`
 - **特殊头**：`User-Agent` → `--user-agent`；`Cookie` → `--cookie`；`Authorization: Basic` →
   `--user`；`Accept-Encoding` 含 gzip/deflate/br/zstd → `--compressed`
 - **跳过头**：`Host`（用于 URL）、`Content-Length`（curl 自动计算）、multipart 的 `Content-Type`
@@ -158,7 +171,9 @@ flag）、URL 含非 ASCII 字符（按 UTF-8 百分号编码）、 Basic 凭据
   请求语义的一部分（安全工具常故意构造），且服务端未必按 RFC 把同名头视作等价——逐条 透传才能保持
   wire format 不变（`-H` 与 `-b` / `-A` 混用会被 curl 抑制，故重复时专属 选项完全不用）
 - **默认头抑制**：若请求未含 `Accept` / `User-Agent` 且未开启允许默认头，追加 `-H 'Accept:'` /
-  `-H 'User-Agent:'` 清空 curl 默认值
+  `-H 'User-Agent:'` 清空 curl 默认值。同理，`--data-binary` 会触发 curl 注入默认
+  `Content-Type: application/x-www-form-urlencoded`：原请求不含 `Content-Type` 时追加
+  `-H 'Content-Type:'` 清空
 - **URL**：`{https|http}://{Host}{path}`；含非 ASCII 字符时按 UTF-8 百分号编码并提醒。 请求行为
   absolute-form 时（`GET http://host/path HTTP/1.1`，完整 URL 写在请求行里， RFC 7230
   规定客户端向代理发请求时必须用这种形态，mitmproxy/Burp/代理日志里粘出来的
@@ -176,6 +191,19 @@ flag）、URL 含非 ASCII 字符（按 UTF-8 百分号编码）、 Basic 凭据
 - **Web**：在输出区显示橙色 warning（与红色 error 区分）
 
 建议改用 `Content-Length` 形式的请求体后重试。
+
+### 二进制请求体会被拒绝
+
+shell 参数无法承载任意字节：非 UTF-8 序列在粘贴/解码阶段已被替换为 U+FFFD， NUL 字节更是无法通过
+shell 传递。检测到请求体含 U+FFFD 替换字符时会**拒绝转换** （CLI stderr 退出码 1 / Web
+橙色提示），避免静默产出发送错误数据的命令。 可把请求体提取为文件后手动改用 `--data-binary @文件`。
+
+### CONNECT 与 asterisk-form
+
+- `CONNECT` 是代理隧道控制报文，单条 curl 命令无法表达隧道语义，**拒绝转换** （复现流量应使用
+  `--proxy` 系列选项）。
+- `OPTIONS * HTTP/1.1` 的 asterisk-form 用 `--request-target '*'` 原样发送 target （URL 只承载
+  authority），并附 warning（需 curl ≥ 7.55）。
 
 ### multipart `--form` 行为说明
 

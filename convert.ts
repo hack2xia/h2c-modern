@@ -276,8 +276,32 @@ export function convert(httpText: string, options: Options = {}): ConvertResult 
   const { req, warnings } = parse(httpText);
   const method = req.method.toUpperCase();
 
+  // CONNECT 是代理隧道控制报文：语义依赖代理连接本身，单条 curl 命令无法表达隧道语义，
+  // 与 chunked 同属"无法忠实表达"，拒绝（复现流量应使用 --proxy 系列选项而非转换报文）。
+  if (method === 'CONNECT') {
+    throw new ConvertWarning(
+      'CONNECT 是代理隧道控制报文，curl 命令无法表达隧道语义' +
+        '（复现流量应使用 --proxy 而非转换报文本身），拒绝转换。',
+    );
+  }
+
+  // 请求体含 U+FFFD 替换字符：输入是已解码的字符串，替换字符意味着原始报文里有
+  // 二进制/非 UTF-8 字节（粘贴/解码过程已损坏）。shell 参数无法承载任意字节，
+  // 生成的命令必然发送错误数据，拒绝；建议提取 body 为文件后手动用 --data-binary @文件。
+  if (req.body.includes('\uFFFD')) {
+    throw new ConvertWarning(
+      '请求体含 U+FFFD 替换字符——原始报文很可能包含二进制或非 UTF-8 字节，' +
+        '在粘贴/解码过程中已被损坏。shell 参数无法承载任意字节，拒绝转换；' +
+        '可将请求体提取为文件后手动改用 --data-binary @文件。',
+    );
+  }
+
   // absolute-form 请求行（GET http://host/path）：URL 自包含，可直接使用
   const absoluteForm = /^https?:\/\//i.test(req.path);
+
+  // asterisk-form 请求行（OPTIONS *）：target 不是路径。curl 默认把 * 当路径拼进 URL，
+  // 改变线上形态；--request-target 可让 curl 原样发送 *（需 curl ≥ 7.55）
+  const asteriskForm = req.path === '*';
 
   // Host：多个 Host 头 RFC 7230 要求必须拒绝（明显错误）；
   // absolute-form 时 Host 可缺省（URL 已含 authority）
@@ -522,15 +546,33 @@ export function convert(httpText: string, options: Options = {}): ConvertResult 
   }
 
   // 9. 请求体
+  // --data-binary 会让 curl 注入默认头 Content-Type: application/x-www-form-urlencoded；
+  // 原请求没有 Content-Type 时必须以 -H 'Content-Type:' 清空（与 Accept / User-Agent 的
+  // 默认头抑制同一手法），否则线上字节被改变。
+  const hasContentType = getHeader(req.headers, 'content-type') !== undefined;
+  const suppressDefaultCT = () => {
+    if (!hasContentType) args.push(opt('--header', '-H'), shQuote('Content-Type:'));
+  };
+  // 原始请求显式声明 Content-Length: 0（POST/PUT 无 body 时常见）：curl 默认一个 CL 头都
+  // 不发，与原报文不一致；--data-binary '' 让 curl 实际发送 Content-Length: 0。
+  // GET/HEAD 除外：--data-binary 会把方法切成 POST / 与 --head 互斥，得不偿失
+  // （GET/HEAD 声明 CL:0 极罕见，维持不注入空 body）。
+  const declaredZeroBody = req.body === '' && method !== 'GET' && method !== 'HEAD' &&
+    clValues.length > 0 &&
+    clValues.every((v) => /^\d+$/.test(v.trim()) && Number(v.trim()) === 0);
   if (multipart) {
     for (const f of parseMultipart(req)) {
       args.push(opt('--form', '-F'), shQuote(f));
     }
   } else if (req.body) {
+    suppressDefaultCT();
     args.push('--data-binary', shQuote(req.body));
+  } else if (declaredZeroBody) {
+    suppressDefaultCT();
+    args.push('--data-binary', shQuote(''));
   } else if (method === 'POST') {
-    // POST 无 body：用 --request POST 明确方法，避免 --data-binary '' 让 curl 注入
-    // Content-Length: 0（原始请求没有该头，注入会改变 wire format）。
+    // POST 无 body 且未声明 CL:0：用 --request POST 明确方法，避免 --data-binary ''
+    // 注入原请求没有的 Content-Length: 0。
     // 注意：若前文已因非 GET/POST 方法追加过 --request，此处不会重复触发。
     args.push(opt('--request', '-X'), 'POST');
   }
@@ -539,7 +581,7 @@ export function convert(httpText: string, options: Options = {}): ConvertResult 
   // 未编码字节 curl 会原样发出，多数服务器也能容忍，但严格场景下 wire format 不合法）
   const rawUrl = absoluteForm
     ? req.path
-    : `${opts.useHttp ? 'http' : 'https'}://${host}${req.path}`;
+    : `${opts.useHttp ? 'http' : 'https'}://${host}${asteriskForm ? '' : req.path}`;
   const url = rawUrl.replace(/[^\p{ASCII}]+/gu, (s) => encodeURIComponent(s));
   if (url !== rawUrl) {
     warnings.push('URL 含非 ASCII 字符，已按 UTF-8 百分号编码');
@@ -557,6 +599,12 @@ export function convert(httpText: string, options: Options = {}): ConvertResult 
     args.push(opt('--globoff', '-g'));
     warnings.push(
       'URL 路径/查询包含 [] 或 {}（curl glob 元字符），已追加 --globoff 按字面发送（不做百分号编码，保持 wire format 不变）',
+    );
+  }
+  if (asteriskForm) {
+    args.push('--request-target', shQuote('*'));
+    warnings.push(
+      '请求行为 asterisk-form（OPTIONS *），已用 --request-target 保持线上形态（需 curl ≥ 7.55）',
     );
   }
   args.push(shQuote(url));

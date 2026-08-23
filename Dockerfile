@@ -1,6 +1,6 @@
 # ---- 构建阶段：用 Deno + esbuild 把 convert.ts 打包成前端模块 ----
 # Deno 2.x 移除了 `deno bundle`，改用 esbuild（通过 npm: 指定符运行）。
-FROM denoland/deno:2.1.4 AS builder
+FROM denoland/deno:2.9.5 AS builder
 
 WORKDIR /app
 COPY convert.ts .

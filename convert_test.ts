@@ -310,7 +310,7 @@ Deno.test('warn: 值相同的重复 Content-Length', () => {
   const result = convert(input);
   assertEquals(
     result.command,
-    "curl --header 'User-Agent:' --header 'Accept:' --data-binary 'hello' 'https://example.com/'",
+    "curl --header 'User-Agent:' --header 'Accept:' --header 'Content-Type:' --data-binary 'hello' 'https://example.com/'",
   );
   assertEquals(result.warnings.length, 1);
 });
@@ -420,7 +420,7 @@ Deno.test('post: 有 body 不追加 --request', () => {
   ].join('\r\n');
   assertEquals(
     convert(input).command,
-    "curl --header 'User-Agent:' --header 'Accept:' --data-binary 'hello' 'https://example.com/api'",
+    "curl --header 'User-Agent:' --header 'Accept:' --header 'Content-Type:' --data-binary 'hello' 'https://example.com/api'",
   );
 });
 
@@ -576,7 +576,7 @@ Deno.test('get: 带 body 用 --request GET 保持方法 + warning', () => {
   const result = convert('GET /search HTTP/1.1\nHost: example.com\n\nquery=1');
   assertEquals(
     result.command,
-    "curl --request GET --header 'User-Agent:' --header 'Accept:' --data-binary 'query=1' 'https://example.com/search'",
+    "curl --request GET --header 'User-Agent:' --header 'Accept:' --header 'Content-Type:' --data-binary 'query=1' 'https://example.com/search'",
   );
   assertEquals(result.warnings.length, 1);
   if (!/GET.*body/.test(result.warnings[0])) {
@@ -588,7 +588,7 @@ Deno.test('get: 带 body 短选项 -X GET', () => {
   const result = convert('GET /search HTTP/1.1\nHost: example.com\n\nx', { shortOpt: true });
   assertEquals(
     result.command,
-    "curl -X GET -H 'User-Agent:' -H 'Accept:' --data-binary 'x' 'https://example.com/search'",
+    "curl -X GET -H 'User-Agent:' -H 'Accept:' -H 'Content-Type:' --data-binary 'x' 'https://example.com/search'",
   );
   assertEquals(result.warnings.length, 1);
 });
@@ -598,7 +598,7 @@ Deno.test('head: 带 body 用 --request HEAD + warning', () => {
   const result = convert('HEAD /x HTTP/1.1\nHost: example.com\n\nhello');
   assertEquals(
     result.command,
-    "curl --request HEAD --header 'User-Agent:' --header 'Accept:' --data-binary 'hello' 'https://example.com/x'",
+    "curl --request HEAD --header 'User-Agent:' --header 'Accept:' --header 'Content-Type:' --data-binary 'hello' 'https://example.com/x'",
   );
   assertEquals(result.warnings.length, 1);
   if (!/HEAD.*body/.test(result.warnings[0])) {
@@ -683,11 +683,20 @@ Deno.test('ok: Content-Length 与 body 字节数一致无 warning', () => {
   const result = convert(
     'POST /api HTTP/1.1\nHost: example.com\nContent-Length: 11\n\nhello world',
   );
+  assertEquals(
+    result.command,
+    "curl --header 'User-Agent:' --header 'Accept:' --header 'Content-Type:' --data-binary 'hello world' 'https://example.com/api'",
+  );
   assertEquals(result.warnings, []);
 });
 
 Deno.test('ok: 无 body 且 Content-Length: 0 无 warning', () => {
   const result = convert('POST /api HTTP/1.1\nHost: example.com\nContent-Length: 0\n');
+  // 原始声明 CL:0：--data-binary '' 让 curl 实际发送 Content-Length: 0（默认一个头都不发）
+  assertEquals(
+    result.command,
+    "curl --header 'User-Agent:' --header 'Accept:' --header 'Content-Type:' --data-binary '' 'https://example.com/api'",
+  );
   assertEquals(result.warnings, []);
 });
 
@@ -705,6 +714,78 @@ Deno.test('warn: Content-Length 非数字值', () => {
   );
   assertEquals(result.warnings.length, 1);
   if (!/Content-Length/.test(result.warnings[0])) {
+    throw new Error(`unexpected warning: ${result.warnings[0]}`);
+  }
+});
+
+// ===== Content-Type 默认值抑制：--data-binary 会让 curl 注入
+// application/x-www-form-urlencoded，原请求无 CT 时必须 -H 'Content-Type:' 清空 =====
+
+// 夹具 09_post_no_ct 覆盖无 CT 的标准形态；这里对照验证已有 CT 时不抑制
+Deno.test('ct: 已有 Content-Type 不追加抑制', () => {
+  const result = convert('POST /a HTTP/1.1\nHost: e.com\nContent-Type: text/plain\n\nhi');
+  assertEquals(
+    result.command,
+    "curl --header 'User-Agent:' --header 'Accept:' --header 'Content-Type: text/plain' --data-binary 'hi' 'https://e.com/a'",
+  );
+  assertEquals(result.warnings, []);
+});
+
+// ===== CL:0 保真：声明 Content-Length: 0 的无 body 请求要让 curl 真的发这个头 =====
+
+Deno.test('cl0: PUT 带 Content-Length: 0 用 --data-binary 保留空 body', () => {
+  const result = convert('PUT /a HTTP/1.1\nHost: example.com\nContent-Length: 0\n');
+  assertEquals(
+    result.command,
+    "curl --request PUT --header 'User-Agent:' --header 'Accept:' --header 'Content-Type:' --data-binary '' 'https://example.com/a'",
+  );
+  assertEquals(result.warnings, []);
+});
+
+Deno.test('cl0: GET 带 Content-Length: 0 不注入空 body（--data-binary 会切 POST）', () => {
+  const result = convert('GET /a HTTP/1.1\nHost: example.com\nContent-Length: 0\n');
+  assertEquals(
+    result.command,
+    "curl --header 'User-Agent:' --header 'Accept:' 'https://example.com/a'",
+  );
+  assertEquals(result.warnings, []);
+});
+
+Deno.test('post: 无 body 且未声明 CL 时仍用 --request POST 不注入', () => {
+  const result = convert('POST /api HTTP/1.1\nHost: example.com\n');
+  if (/--data-binary/.test(result.command)) {
+    throw new Error(`原始请求没有声明 CL，不应注入空 body: ${result.command}`);
+  }
+});
+
+// ===== 二进制 body：U+FFFD 替换字符 → 拒绝转换（shell 无法承载任意字节） =====
+
+Deno.test('binary: 请求体含 U+FFFD 拒绝转换', () => {
+  const input = 'POST /up HTTP/1.1\nHost: example.com\nContent-Length: 6\n\nab\uFFFDefg';
+  assertThrows(() => convert(input), ConvertWarning, 'U+FFFD');
+});
+
+// ===== CONNECT：代理隧道控制报文，无法表达 =====
+
+Deno.test('error: CONNECT 拒绝转换', () => {
+  assertThrows(
+    () => convert('CONNECT example.com:443 HTTP/1.1\nHost: example.com:443\n'),
+    ConvertWarning,
+    'CONNECT',
+  );
+});
+
+// ===== asterisk-form：OPTIONS * → --request-target 原样发送 =====
+
+Deno.test('warn: asterisk-form 用 --request-target 保持线上形态', () => {
+  const result = convert('OPTIONS * HTTP/1.1\nHost: example.com\n');
+  // URL 只承载 authority（不拼接 *）；--request-target 让 curl 原样发送 target
+  assertEquals(
+    result.command,
+    "curl --request OPTIONS --header 'User-Agent:' --header 'Accept:' --request-target '*' 'https://example.com'",
+  );
+  assertEquals(result.warnings.length, 1);
+  if (!/asterisk-form/.test(result.warnings[0])) {
     throw new Error(`unexpected warning: ${result.warnings[0]}`);
   }
 });
