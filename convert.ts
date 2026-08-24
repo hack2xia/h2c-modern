@@ -218,12 +218,37 @@ function isMultipart(req: ParsedRequest): boolean {
   return !!ct && ct.toLowerCase().includes('multipart/form-data');
 }
 
-/** 解析 multipart body，返回 --form 的参数列表（不含选项名）
+/** 一个 multipart part 对应的 curl 参数 */
+interface FormArg {
+  /** 选项参数内容（name=value / name=@file），不含选项名 */
+  content: string;
+  /**
+   * true → 必须用 --form-string 发送：--form 的值语法会把前导 @ / <（读本地文件）与
+   * 内嵌 ;type= / ;filename= / ;encoder= / ;headers= 指令特殊解释，字面值会被静默
+   * 改变（实测：'@bruce' 触发读文件报错，'hello;filename=x' 篡改 Content-Disposition）。
+   */
+  literal: boolean;
+}
+
+/** multipart 解析结果：--form 参数 + 解析阶段产生的非阻断提醒 */
+interface MultipartResult {
+  forms: FormArg[];
+  warnings: string[];
+}
+
+/** 判断 --form 的字段值是否会被 curl 值语法特殊解释，需要改用 --form-string */
+function needsFormString(value: string): boolean {
+  // 大小写不敏感宁可多触发：--form-string 对安全值也逐字面发送，线上形态一致
+  return value.startsWith('@') || value.startsWith('<') ||
+    /;(?:type|filename|encoder|headers)=/i.test(value);
+}
+
+/** 解析 multipart body，返回各 part 的 curl 参数
  * @throws 缺 boundary、解析不出任何 part、part 缺 Content-Disposition、
  *   或 part 被截断（有 CD 但无 header/body 空行）时抛 ConvertWarning——
  *   静默输出会丢失请求体语义，宁可拒绝并提示用户检查原始请求。
  */
-function parseMultipart(req: ParsedRequest): string[] {
+function parseMultipart(req: ParsedRequest): MultipartResult {
   const ct = getHeader(req.headers, 'content-type')!;
   const m = ct.match(/boundary=("?)([^";]+)\1/i);
   if (!m) {
@@ -234,7 +259,8 @@ function parseMultipart(req: ParsedRequest): string[] {
   const boundary = m[2];
   const delimiter = '--' + boundary;
 
-  const forms: string[] = [];
+  const forms: FormArg[] = [];
+  const warnings: string[] = [];
   const segments = req.body.split(delimiter);
 
   for (const seg of segments) {
@@ -287,9 +313,18 @@ function parseMultipart(req: ParsedRequest): string[] {
     const typeSuffix = partCT ? `;type=${partCT}` : '';
 
     if (fileMatch) {
-      forms.push(`${name}=@${fileMatch[1]}${typeSuffix}`);
+      forms.push({ content: `${name}=@${fileMatch[1]}${typeSuffix}`, literal: false });
+    } else if (needsFormString(partBody)) {
+      // --form-string 整体字面发送（含 @ / ;type= 等文本），线上形态与原报文一致；
+      // 代价：它不解析任何指令，part 级 Content-Type 无法附带，需提醒
+      if (partCT) {
+        warnings.push(
+          `multipart field "${name}": its value would be misparsed by --form syntax (@/< prefix or ;type=/;filename=/;encoder=/;headers= inside the value); using --form-string to send it literally, which drops the part's Content-Type (${partCT})`,
+        );
+      }
+      forms.push({ content: `${name}=${partBody}`, literal: true });
     } else {
-      forms.push(`${name}=${partBody}${typeSuffix}`);
+      forms.push({ content: `${name}=${partBody}${typeSuffix}`, literal: false });
     }
   }
 
@@ -299,7 +334,7 @@ function parseMultipart(req: ParsedRequest): string[] {
     );
   }
 
-  return forms;
+  return { forms, warnings };
 }
 
 /** 转换警告：可恢复但应让用户知晓的问题（如 chunked 无法表达） */
@@ -642,8 +677,11 @@ export function convert(httpText: string, options: Options = {}): ConvertResult 
     clValues.length > 0 &&
     clValues.every((v) => /^\d+$/.test(v.trim()) && Number(v.trim()) === 0);
   if (multipart) {
-    for (const f of parseMultipart(req)) {
-      args.push(opt('--form', '-F'), q(f));
+    const { forms, warnings: mpWarnings } = parseMultipart(req);
+    warnings.push(...mpWarnings);
+    for (const f of forms) {
+      // --form-string 没有短选项（-F 只对应 --form），字面 part 必须用长选项
+      args.push(f.literal ? '--form-string' : opt('--form', '-F'), q(f.content));
     }
   } else if (req.body) {
     suppressDefaultCT();

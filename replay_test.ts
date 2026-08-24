@@ -9,8 +9,10 @@
 // - Content-Length 行整体剔除：本工具把 CL 交给 curl 按实际 body 重算（原报文有/无、
 //   值对/错都会被替换），body 字节一致性已单独校验，足以覆盖长度错误
 // - HTTP 版本 token（版本保真由 -i 选项管辖，回放不启用；04 夹具请求行为 HTTP/2）
-// - 06_multipart 单独校验：curl 重新生成 boundary（body 必然不同），
-//   只验请求行 + Content-Type 形态；其 @file 引用替换为内联值，避免依赖仓库文件
+// - multipart 夹具单独校验：curl 重新生成 boundary（body 必然不同），退化为逐 part
+//   比对（name / filename / part 级 Content-Type / body）；真 filename part 的 @file
+//   引用重定向到内容等同原报文的临时文件（保持 curl 真实读文件路径可回放，不依赖
+//   仓库文件），--form-string 的字面值（可能恰好以 @ 开头）与普通字段值原样保留
 import { assert, assertEquals } from 'jsr:@std/assert@^1.0.19';
 import { convert } from './convert.ts';
 
@@ -56,6 +58,69 @@ function concatBytes(chunks: Uint8Array[]): Uint8Array {
     off += c.length;
   }
   return out;
+}
+
+/** multipart 报文中的一个 part（回放比对用） */
+interface ReplayPart {
+  name: string;
+  filename?: string;
+  contentType?: string;
+  body: string;
+}
+
+/** 从 multipart 报文文本提取各 part，行尾统一为 CRLF（夹具 LF / 线上 CRLF 可比） */
+function extractParts(message: string): ReplayPart[] {
+  const text = message.replace(/\r?\n/g, '\r\n');
+  const headEnd = text.indexOf('\r\n\r\n');
+  const head = headEnd === -1 ? text : text.slice(0, headEnd);
+  const body = headEnd === -1 ? '' : text.slice(headEnd + 4);
+  const ctLine = head.split('\r\n').find((l) => /^content-type:/i.test(l)) ?? '';
+  const m = /boundary=("?)([^";\s]+)\1/i.exec(ctLine);
+  if (!m) return [];
+  const parts: ReplayPart[] = [];
+  for (const seg of body.split('--' + m[2])) {
+    const part = seg.replace(/^\r\n/, '').replace(/\r\n$/, '');
+    if (!part || part === '--') continue;
+    const sep = part.indexOf('\r\n\r\n');
+    if (sep === -1) continue; // preamble / epilogue / 截断
+    const headLines = part.slice(0, sep).split('\r\n');
+    const cd = headLines.find((l) => /^content-disposition:/i.test(l)) ?? '';
+    const partCT = headLines.find((l) => /^content-type:/i.test(l));
+    parts.push({
+      name: /name="([^"]*)"/i.exec(cd)?.[1] ?? '',
+      filename: /filename="([^"]*)"/i.exec(cd)?.[1],
+      contentType: partCT?.replace(/^content-type:[ \t]*/i, '').replace(/[ \t]+$/, ''),
+      body: part.slice(sep + 4),
+    });
+  }
+  return parts;
+}
+
+/** 逐 part 比对 multipart 报文：name / filename / body 一致；Content-Type 对字符串
+ * part 严格一致（curl 不额外注入），file part 仅在原 part 显式声明时校验（未声明时
+ * curl 按扩展名猜测，属文档化的有损映射） */
+function assertPartsEqual(wire: string, want: string, label: string) {
+  const wireParts = extractParts(wire);
+  const wantParts = extractParts(want);
+  assertEquals(wireParts.length, wantParts.length, `${label}: part 数量`);
+  for (let i = 0; i < wantParts.length; i++) {
+    assertEquals(wireParts[i].name, wantParts[i].name, `${label}: part ${i} name`);
+    assertEquals(
+      wireParts[i].filename,
+      wantParts[i].filename,
+      `${label}: part ${i} filename`,
+    );
+    assertEquals(wireParts[i].body, wantParts[i].body, `${label}: part ${i} body`);
+    if (
+      wantParts[i].filename === undefined || wantParts[i].contentType !== undefined
+    ) {
+      assertEquals(
+        wireParts[i].contentType,
+        wantParts[i].contentType,
+        `${label}: part ${i} content-type`,
+      );
+    }
+  }
 }
 
 function indexOfSeq(hay: Uint8Array, needle: number[]): number {
@@ -124,6 +189,8 @@ function normalizeWire(bytes: Uint8Array): string {
 }
 
 Deno.test('replay: 夹具生成的命令实际发送的字节与原始报文一致', async () => {
+  // multipart 的 @file part 写入临时文件：curl 走真实读文件路径，body/filename 均可比对
+  const tmpDir = await Deno.makeTempDir({ prefix: 'h2c-replay-' });
   const listener = Deno.listen({ hostname: '127.0.0.1', port: 0 });
   const port = (listener.addr as Deno.NetAddr).port;
   const RESP_OK = 'HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok';
@@ -168,11 +235,29 @@ Deno.test('replay: 夹具生成的命令实际发送的字节与原始报文一�
         `http://127.0.0.1:${port}`,
       );
 
-      const isMultipart = name === '06_multipart';
+      // multipart 检测按报文自身的 CT 头，不依赖夹具名
+      const isMultipart = /^content-type: multipart\/form-data/im.test(raw);
+      // 真 filename part（--form 的 name=@file）依赖本地文件：把原报文该 part 的
+      // body 写入临时文件、@引用重定向过去；--form-string 的字面值（可能恰好以 @
+      // 开头）与普通字段值原样保留，不做替换
+      let fileMap: Map<string, string> | undefined;
+      if (isMultipart) {
+        fileMap = new Map();
+        for (const p of extractParts(raw)) {
+          if (p.filename !== undefined && !fileMap.has(p.filename)) {
+            const f = `${tmpDir}/${p.filename}`;
+            Deno.writeTextFileSync(f, p.body);
+            fileMap.set(p.filename, f);
+          }
+        }
+      }
       const args = ['-s', '--max-time', '5'];
       for (let i = 1; i < parsed.length - 1; i++) {
         let a = parsed[i];
-        if (isMultipart && /=@/.test(a)) a = a.replace(/=@.*/, '=replay-inline');
+        if (fileMap && (parsed[i - 1] === '--form' || parsed[i - 1] === '-F')) {
+          const m = /^([^=]+)=@([^;]+)(;.*)?$/.exec(a);
+          if (m && fileMap.has(m[2])) a = `${m[1]}=@${fileMap.get(m[2])}${m[3] ?? ''}`;
+        }
         args.push(a);
       }
       args.push(parsed[parsed.length - 1]);
@@ -192,14 +277,20 @@ Deno.test('replay: 夹具生成的命令实际发送的字节与原始报文一�
       if (received === undefined) throw new Error(`${name}: 回显服务器未收到请求`);
 
       if (isMultipart) {
-        // boundary 由 curl 重新生成，body 必然不同：只校验请求行 + CT 形态
+        // boundary 由 curl 重新生成，无法整体比对：请求行 + CT 形态单独校验，
+        // 其余退化为逐 part 比对（name / filename / part 级 CT / 字符串 part 的 body）
         const head = dec.decode(received).split('\r\n\r\n')[0];
         const lines = head.split('\r\n');
-        assertEquals(lines[0], 'POST /upload HTTP/1.1', name);
+        assertEquals(
+          lines[0].replace(/HTTP\/[\w.]+$/, 'HTTP/NORM'),
+          raw.split(/\r?\n/)[0].replace(/HTTP\/[\w.]+$/, 'HTTP/NORM'),
+          `${name}: 请求行`,
+        );
         assert(
           lines.some((l) => /^content-type: multipart\/form-data; boundary=/i.test(l)),
           `${name}: 缺少 multipart Content-Type`,
         );
+        assertPartsEqual(dec.decode(received), raw, name);
       } else {
         assertEquals(normalizeWire(received), normalizeWire(enc.encode(raw)), name);
       }
@@ -207,5 +298,6 @@ Deno.test('replay: 夹具生成的命令实际发送的字节与原始报文一�
   } finally {
     listener.close();
     await server;
+    await Deno.remove(tmpDir, { recursive: true });
   }
 });

@@ -1,0 +1,17 @@
+POST /submit HTTP/1.1
+Host: example.com
+Content-Type: multipart/form-data; boundary=----XYZBoundary
+
+------XYZBoundary
+Content-Disposition: form-data; name="mention"
+
+@bruce
+------XYZBoundary
+Content-Disposition: form-data; name="note"
+
+ratio;type=fast
+------XYZBoundary
+Content-Disposition: form-data; name="snippet"
+
+<script>alert(1)</script>
+------XYZBoundary--

@@ -38,7 +38,8 @@ h2c-modern/
 │   ├── 06_multipart.*
 │   ├── 07_urlencoded.*
 │   ├── 08_bearer.*
-│   └── 09_post_no_ct.*
+│   ├── 09_post_no_ct.*
+│   └── 10_multipart_special.*
 ├── _build/              # build artifacts (gitignored)
 │   ├── convert.mjs      # esbuild bundle, imported by the web page
 │   └── h2c              # standalone binary from deno compile
@@ -255,9 +256,18 @@ a file and use `--data-binary @file` manually.
 
 `multipart/form-data` requests are converted into multiple `--form` arguments:
 
-- plain fields → `name=value`
+- plain fields → `name=value`; when the value would be misparsed by `--form`'s value syntax,
+  `--form-string` is used instead (see below)
 - **fields with `filename` → `name=@filename`** (plus `;type=<ct>` when the part declares a
   Content-Type)
+
+`--form`'s value syntax specially interprets a **leading `@` / `<` (read a local file) and embedded
+`;type=` / `;filename=` / `;encoder=` / `;headers=` directives**: a field value `@bruce` makes curl
+try to read a file named `bruce` (the command just fails), and `hello;filename=x` gets rewritten
+into the Content-Disposition — the literal value is silently changed. Such values are therefore sent
+with `--form-string` (fully literal, wire-identical; no short option, requires curl ≥ 7.43). The
+cost: `--form-string` parses no directives, so a part-level `Content-Type` cannot be attached — when
+the two conflict, value fidelity wins, the `;type=` is dropped, and a warning is emitted.
 
 `@filename` is curl syntax: it makes curl **read the content from a local file** instead of sending
 the bytes from the original request body. In other words, the generated command depends on a local

@@ -36,7 +36,8 @@ h2c-modern/
 │   ├── 06_multipart.*
 │   ├── 07_urlencoded.*
 │   ├── 08_bearer.*
-│   └── 09_post_no_ct.*
+│   ├── 09_post_no_ct.*
+│   └── 10_multipart_special.*
 ├── _build/              # 构建产物（gitignore）
 │   ├── convert.mjs      # esbuild 打包生成，供前端 import
 │   └── h2c              # deno compile 生成的独立二进制
@@ -228,8 +229,15 @@ shell 传递。检测到请求体含 U+FFFD 替换字符时会**拒绝转换** �
 
 `multipart/form-data` 请求被转换为多个 `--form` 参数：
 
-- 普通字段 → `name=value`
+- 普通字段 → `name=value`；当值会被 `--form` 的值语法特殊解释时改用 `--form-string` 字面发送（见下）
 - **带 `filename` 的字段 → `name=@filename`**（part 声明了 Content-Type 时追加 `;type=<ct>`）
+
+`--form` 的值语法会把**前导 `@` / `<`（读本地文件）与内嵌 `;type=` / `;filename=` / `;encoder=` /
+`;headers=` 指令**特殊解释：字段值 `@bruce` 会让 curl 去读名为 bruce 的文件
+（命令直接报错），`hello;filename=x` 则被改写成 Content-Disposition 的一部分——字面值被
+静默改变。因此此类值改用 `--form-string`（完全字面发送，线上形态一致；无短选项，需 curl ≥
+7.43）。代价是 `--form-string` 不解析任何指令，无法附带 part 级 `Content-Type`——
+两者冲突时值的忠实度优先，丢弃 `;type=` 并给出 warning。
 
 `@filename` 是 curl 的语法，会让 curl **从本地文件读取内容上传**，而不是发送原始请求体里的字节。
 也就是说，生成的 curl 命令依赖本地存在同名文件。若想用原始请求体里的内容，请手动把 `@filename`

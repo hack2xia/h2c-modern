@@ -268,6 +268,92 @@ Deno.test('multipart: 值字段 Content-Type 同样保留', () => {
   );
 });
 
+// --form 的值语法会特殊解释前导 @/<（读本地文件）与内嵌 ;type= 等指令，
+// 字面值会被静默改变；此类值改用 --form-string 整体字面发送（线上形态一致）。
+// @ 前缀与 ;type= 文本的回归由夹具 10_multipart_special 覆盖，此处补其余形态
+Deno.test('multipart: 值以 < 开头用 --form-string', () => {
+  const input = [
+    'POST / HTTP/1.1',
+    'Host: example.com',
+    'Content-Type: multipart/form-data; boundary=xyz',
+    '',
+    '--xyz',
+    'Content-Disposition: form-data; name="snippet"',
+    '',
+    '<script>alert(1)</script>',
+    '--xyz--',
+  ].join('\n');
+  assertEquals(
+    convert(input).command,
+    "curl --header 'User-Agent:' --header 'Accept:' --form-string 'snippet=<script>alert(1)</script>' 'https://example.com/'",
+  );
+});
+
+Deno.test('multipart: 值含 ;filename= 指令文本用 --form-string', () => {
+  const input = [
+    'POST / HTTP/1.1',
+    'Host: example.com',
+    'Content-Type: multipart/form-data; boundary=xyz',
+    '',
+    '--xyz',
+    'Content-Disposition: form-data; name="note"',
+    '',
+    'hello;filename=x',
+    '--xyz--',
+  ].join('\n');
+  assertEquals(
+    convert(input).command,
+    "curl --header 'User-Agent:' --header 'Accept:' --form-string 'note=hello;filename=x' 'https://example.com/'",
+  );
+});
+
+// 字面值与 part 级 Content-Type 无法共存：--form-string 不解析指令，;type= 附不上。
+// 值的忠实度优先于 part 头，丢弃 CT 并提醒
+Deno.test('multipart: 字面值与 part Content-Type 冲突时丢弃 CT + warning', () => {
+  const input = [
+    'POST / HTTP/1.1',
+    'Host: example.com',
+    'Content-Type: multipart/form-data; boundary=xyz',
+    '',
+    '--xyz',
+    'Content-Disposition: form-data; name="who"',
+    'Content-Type: text/html',
+    '',
+    '@here',
+    '--xyz--',
+  ].join('\n');
+  const result = convert(input);
+  assertEquals(
+    result.command,
+    "curl --header 'User-Agent:' --header 'Accept:' --form-string 'who=@here' 'https://example.com/'",
+  );
+  assertEquals(result.warnings.length, 1);
+  assert(/drops the part's Content-Type \(text\/html\)/.test(result.warnings[0]));
+});
+
+// --form-string 没有短选项：shortOpt 下其余 part 仍用 -F，字面 part 保持长选项
+Deno.test('multipart: shortOpt 下字面 part 仍用长选项 --form-string', () => {
+  const input = [
+    'POST / HTTP/1.1',
+    'Host: example.com',
+    'Content-Type: multipart/form-data; boundary=xyz',
+    '',
+    '--xyz',
+    'Content-Disposition: form-data; name="plain"',
+    '',
+    'ok',
+    '--xyz',
+    'Content-Disposition: form-data; name="at"',
+    '',
+    '@you',
+    '--xyz--',
+  ].join('\n');
+  assertEquals(
+    convert(input, { shortOpt: true }).command,
+    "curl -H 'User-Agent:' -H 'Accept:' -F 'plain=ok' --form-string 'at=@you' 'https://example.com/'",
+  );
+});
+
 // 重复 Cookie 头：逐条透传为 -H，保持 wire format（安全工具常故意构造重复头，
 // 合并为 "; " 会改变线上字节；且 -H 'Cookie:' 会抑制 -b，不能混用）
 Deno.test('dup headers: 多个 Cookie 逐条透传', () => {

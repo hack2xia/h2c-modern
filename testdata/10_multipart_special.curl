@@ -1,0 +1,1 @@
+curl --header 'User-Agent:' --header 'Accept:' --form-string 'mention=@bruce' --form-string 'note=ratio;type=fast' --form-string 'snippet=<script>alert(1)</script>' 'https://example.com/submit'
