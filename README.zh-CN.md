@@ -159,18 +159,22 @@ warning 提醒（CLI 走 stderr 不影响管道，Web 显示在输出区下方�
 拒绝（明显错误 / 无法忠实表达）：空请求、请求行不是 `METHOD target [HTTP/x]` 两到三段、 method
 不是合法 RFC token（tchar，如含分号、括号的注入载荷）、非法 request-target 形态（不以 `/` 开头且非
 absolute-form / asterisk-form，如裸 `foo` 或非 CONNECT 的 authority-form； asterisk-form 仅限
-`OPTIONS`）、 无冒号的 header 行、header 区含裸 CR（CR 仅可 作为 CRLF 的
-组成部分，属请求走私向量）、缺 `Host`（absolute-form 除外）、 多个 `Host`、`Host` 不是合法
-authority（含 userinfo `@` / 路径 / 查询 / fragment 字符、端口越界或非数字、IPv6 未 bracket
-包裹——这类值拼进 URL 后会被 URL parser 重新解释，造成目标主机混淆）、值不同的重复
-`Content-Length`（请求走私特征）、`Transfer-Encoding: chunked`（检查全部同名头的全部 逗号
-token，`TE: gzip` + `TE: chunked` 或单条 `TE: gzip, chunked` 同样拒绝）、请求体含二进制/非 UTF-8
-字节（U+FFFD 替换字符）、`CONNECT`（代理隧道控制报文）。
+`OPTIONS`）、request-target 含裸 `#` fragment（RFC 7230 禁止 target 携带 fragment，且 curl 会把它
+从请求行静默丢弃，`--path-as-is` 也无济于事——转换必然丢字节）、 无冒号的 header 行、header 区含裸
+CR（CR 仅可 作为 CRLF 的组成部分，属请求走私向量）、缺 `Host`（absolute-form 除外）、 多个
+`Host`、`Host` 不是合法 authority（含 userinfo `@` / 路径 / 查询 / fragment 字符、端口越界或非
+数字、IPv6 未 bracket 包裹——这类值拼进 URL 后会被 URL parser 重新解释，造成目标主机混淆）、
+值不同的重复 `Content-Length`（请求走私特征）、`Transfer-Encoding: chunked`（检查全部同名头的全部
+逗号 token，`TE: gzip` + `TE: chunked` 或单条 `TE: gzip, chunked` 同样拒绝）、输入任意位置含 NUL
+字节（shell argv 无法承载 NUL）或二进制/非 UTF-8 字节（U+FFFD 替换字符，请求行 / header / body
+任一位置）、`CONNECT`（代理隧道控制报文）。
 
 生成 + warning（可能有问题）：absolute-form 请求行（直接使用其中 URL；与 `Host` 不一致时
-追加提醒）、obs-fold 折叠头（按 RFC 展开）、`OPTIONS *` 的 asterisk-form 请求行（用
-`--request-target` 原样发送 target，需 curl ≥ 7.55）、值相同的重复 `Content-Length`（忽略）、
-`Content-Length` 与 body 实际字节数不一致（声明大于实际时提示请求体可能被截断；curl 会按实际长度
+追加提醒）、obs-fold 折叠头（按 RFC 展开）、header name 不是合法 RFC 7230 field-name token
+（原样透传——服务端可能拒绝或整行忽略该头）、field-value 仅由 OWS 组成（curl 无法复现纯 OWS
+的值，退化为空值头发送）、`OPTIONS *` 的 asterisk-form 请求行（用 `--request-target` 原样发送
+target，需 curl ≥ 7.55）、值相同的重复 `Content-Length`（忽略）、 `Content-Length` 与 body
+实际字节数不一致（声明大于实际时提示请求体可能被截断；curl 会按实际长度
 重算；多出的字节恰好是一段结尾 LF/CRLF 时，warning 会明确提示这很可能只是粘贴文本的末尾换行）、
 `Content-Length` 值非数字（curl 自动按 body 计算）、`-i` 遇到未识别的 HTTP 版本（不输出 flag）、URL
 含非 ASCII 字符（按 UTF-8 百分号编码）、 Basic 凭据解码后含非 ASCII 字节（超出 `user:password`
@@ -201,10 +205,15 @@ PowerShell 5.1 向原生程序传参会破坏此类参数，命令需 PowerShell
   `-H 'User-Agent:'` 清空 curl 默认值。同理，`--data-raw` 会触发 curl 注入默认
   `Content-Type: application/x-www-form-urlencoded`：原请求不含 `Content-Type` 时追加
   `-H 'Content-Type:'` 清空
+- **空值 header**：原始报文的空值头（`X-Empty:`）用 curl 的**分号形式** `-H 'X-Empty;'` 发送—— colon
+  形式 `-H 'X-Empty:'` 会被 curl 当作"删除该头"，这正是上方合成抑制头所利用的语义。
+  分号形式在线上发出 `X-Empty:`（已用真实回放逐字节验证）
 - **curl 配置隔离**：生成的命令以 `--disable`（`-q`）开头，跳过用户本机的 `~/.curlrc`，防止
   本地配置（proxy、header、认证等）改变请求语义，保证命令自包含
-- **URL**：`{https|http}://{Host}{path}`；含非 ASCII 字符时按 UTF-8 百分号编码并提醒。 请求行为
-  absolute-form 时（`GET http://host/path HTTP/1.1`，完整 URL 写在请求行里， RFC 7230
+- **URL**：`{https|http}://{Host}{path}`；含非 ASCII 字符时按 UTF-8 百分号编码并提醒；路径含
+  dot-segment（`/./` 或 `/../`）时追加 `--path-as-is` 让 curl 原样发送请求行（curl 默认会按 URL
+  标准折叠，如 `/a/../b` → `/b`）。请求行为 absolute-form 时（`GET http://host/path HTTP/1.1`，完整
+  URL 写在请求行里， RFC 7230
   规定客户端向代理发请求时必须用这种形态，mitmproxy/Burp/代理日志里粘出来的
   请求常是这样）直接使用其中的 URL
 
@@ -221,11 +230,12 @@ PowerShell 5.1 向原生程序传参会破坏此类参数，命令需 PowerShell
 
 建议改用 `Content-Length` 形式的请求体后重试。
 
-### 二进制请求体会被拒绝
+### 二进制字节会被拒绝
 
 shell 参数无法承载任意字节：非 UTF-8 序列在粘贴/解码阶段已被替换为 U+FFFD， NUL 字节更是无法通过
-shell 传递。检测到请求体含 U+FFFD 替换字符时会**拒绝转换** （CLI stderr 退出码 1 / Web
-橙色提示），避免静默产出发送错误数据的命令。 可把请求体提取为文件后手动改用 `--data-binary @文件`。
+shell 传递。输入（请求行 / header / body）任一位置含 U+FFFD 替换字符或 NUL 字节时都会**拒绝转换**
+（CLI stderr 退出码 1 / Web 橙色提示），避免静默产出发送错误数据的命令。若 body 是二进制，可把它
+提取为文件后手动改用 `--data-binary @文件`。
 
 ### CONNECT 与 asterisk-form
 

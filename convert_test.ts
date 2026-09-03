@@ -1215,3 +1215,94 @@ Deno.test('security: --disable 是 curl 的第一个参数', () => {
   const ps = convert('GET / HTTP/1.1\nHost: example.com\n', { shell: 'powershell' });
   assert(ps.command.startsWith('curl.exe --disable '));
 });
+
+// ===== H4：request-target 保真 =====
+
+// 裸 # fragment 会被 curl 从请求行静默丢弃（--path-as-is 也无效），拒绝转换
+Deno.test('path: request-target 含 fragment 拒绝', () => {
+  assertThrows(
+    () => convert('GET /x#ignored HTTP/1.1\nHost: example.com\n'),
+    Error,
+    'fragment',
+  );
+  assertThrows(
+    () => convert('GET http://example.com/x#frag HTTP/1.1\n'),
+    Error,
+    'fragment',
+  );
+});
+
+// dot-segment 加 --path-as-is（curl 默认折叠 /a/../b → /b），普通路径不受影响
+Deno.test('path: dot-segment 追加 --path-as-is', () => {
+  const r = convert('GET /a/../b HTTP/1.1\nHost: example.com\n');
+  assert(r.command.includes("--path-as-is 'https://example.com/a/../b'"));
+  const r2 = convert('GET /a/./b HTTP/1.1\nHost: example.com\n');
+  assert(r2.command.includes('--path-as-is'));
+  const r3 = convert('GET /a//b HTTP/1.1\nHost: example.com\n');
+  assert(!r3.command.includes('--path-as-is')); // curl 不折叠双斜杠
+  const r4 = convert('GET /plain HTTP/1.1\nHost: example.com\n');
+  assert(!r4.command.includes('--path-as-is'));
+});
+
+// ===== H5：空值 header 分号形式 =====
+
+// 原始空值头 "X-Empty:" 用分号形式（colon 形式会被 curl 当"删除该头"）
+Deno.test('headers: 空值 header 用分号形式发送', () => {
+  const result = convert('GET / HTTP/1.1\nHost: example.com\nX-Empty:\n');
+  assert(result.command.includes("--header 'X-Empty;'"));
+  assert(!result.command.includes('X-Empty:'));
+  assertEquals(result.warnings, []);
+});
+
+// 值仅由 OWS 组成：curl 无法复现纯 OWS field-value，退化为空值 + warning
+Deno.test('headers: 纯 OWS 值的 header 退化空值 + warning', () => {
+  const result = convert('GET / HTTP/1.1\nHost: example.com\nX-Ws: \n');
+  assert(result.command.includes("--header 'X-Ws;'"));
+  assertEquals(result.warnings.length, 1);
+  assert(result.warnings[0].includes('only of whitespace'));
+});
+
+// 合成的默认头抑制仍用 colon 形式（与原始空头区分）
+Deno.test('headers: 合成抑制头保持 colon 形式', () => {
+  const result = convert('GET / HTTP/1.1\nHost: example.com\n');
+  assert(result.command.includes("--header 'User-Agent:'"));
+  assert(result.command.includes("--header 'Accept:'"));
+});
+
+// ===== H8：字符与语法校验 =====
+
+Deno.test('security: 输入含 NUL 拒绝转换', () => {
+  assertThrows(
+    () => convert('GET / HTTP/1.1\nHost: example.com\nX-A: a\u0000b\n'),
+    Error,
+    'NUL',
+  );
+  assertThrows(
+    () => convert('GET / HTTP/1.1\nHost: example.com\n\nbody\u0000'),
+    Error,
+    'NUL',
+  );
+});
+
+Deno.test('security: header 含 U+FFFD 也拒绝转换', () => {
+  assertThrows(
+    () => convert('GET / HTTP/1.1\nHost: example.com\nX-A: ab\uFFFDefg\n'),
+    ConvertWarning,
+    'U+FFFD',
+  );
+  assertThrows(
+    () => convert('GET / HTTP/1.1\nHost: \uFFFDefg.com\n'),
+    ConvertWarning,
+    'U+FFFD',
+  );
+});
+
+Deno.test('headers: 非法 field-name token 加 warning', () => {
+  const result = convert('GET / HTTP/1.1\nHost: example.com\nX Y: z\n');
+  assertEquals(
+    result.command,
+    "curl --disable --header 'User-Agent:' --header 'Accept:' --header 'X Y: z' 'https://example.com/'",
+  );
+  assertEquals(result.warnings.length, 1);
+  assert(result.warnings[0].includes('field-name'));
+});

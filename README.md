@@ -169,35 +169,41 @@ Refused (clear errors / impossible to express faithfully): empty request; reques
 `METHOD target [HTTP/x]` in two or three tokens; a method that isn't a valid RFC token (tchar — e.g.
 injection payloads containing semicolons or parentheses); invalid request-target form (not starting
 with `/` and not absolute-form / asterisk-form — e.g. bare `foo` or authority-form on a non-CONNECT
-method; asterisk-form is only valid for `OPTIONS`); header line without a colon; a bare CR inside
+method; asterisk-form is only valid for `OPTIONS`); a request-target containing a raw `#` fragment
+(RFC 7230 forbids fragments in a target, and curl silently drops them from the request line — even
+`--path-as-is` does not help, so this is data loss); header line without a colon; a bare CR inside
 the header section (CR is only valid as part of CRLF — a request smuggling vector); missing `Host`
 (unless absolute-form); multiple `Host` headers; a `Host` that isn't a valid authority (userinfo
 `@`, path/query/fragment characters, out-of-range or non-numeric port, unbracketed IPv6 — such
 values would be reinterpreted by the URL parser once concatenated into the URL, causing target host
 confusion); duplicate `Content-Length` with different values (an HTTP request smuggling signature);
 `Transfer-Encoding: chunked` (all same-name headers and comma tokens are checked — `TE: gzip` +
-`TE: chunked` or a single `TE: gzip, chunked` is refused as well); body containing binary /
-non-UTF-8 bytes (U+FFFD replacement characters); `CONNECT` (proxy tunnel control message).
+`TE: chunked` or a single `TE: gzip, chunked` is refused as well); NUL bytes anywhere in the input
+(shell arguments cannot carry NUL); binary / non-UTF-8 bytes anywhere in the input (U+FFFD
+replacement characters); `CONNECT` (proxy tunnel control message).
 
 Generated + warning (questionable): absolute-form request line (the URL is used directly; an extra
-warning is added if it disagrees with the `Host` header); obs-folded headers (unfolded per RFC);
-asterisk-form `OPTIONS *` (target sent verbatim via `--request-target`, requires curl ≥ 7.55);
-duplicate `Content-Length` with identical values (ignored); `Content-Length` disagreeing with the
-actual body byte count (declared > actual suggests a truncated body — a more explicit hint; curl
-recomputes from the actual length; when the excess is exactly a trailing LF/CRLF, the warning calls
-out the likely paste artifact); non-numeric `Content-Length` (curl computes from the body);
-unrecognized HTTP version with `-i` (no version flag emitted); non-ASCII URL characters
-(percent-encoded as UTF-8); Basic credentials decoding to non-ASCII bytes (outside the usual
-`user:password` range; RFC 7617 doesn't specify an encoding, so the `Authorization` header is passed
-through verbatim instead of guessing); `Transfer-Encoding` and `Content-Length` both present (a
-request smuggling signature; curl recomputes CL from the actual body and sends it alongside the TE
-headers); `GET` / `HEAD` with a body (curl's `--data-raw` would switch the method to POST, and
-`--head` conflicts with a body, so `--request GET` / `--request HEAD` is added to keep the method —
-some servers/proxies reject such requests); `{}` / `[]` in the URL path/query (curl treats these as
-glob metacharacters by default: `{a,b}` sends multiple requests and `[abc]` errors out; `--globoff`
-is appended to send them literally, without percent-encoding, keeping the wire format unchanged);
-argument values containing double quotes under the PowerShell dialect (Windows PowerShell 5.1
-mangles such arguments when invoking native executables; the command requires PowerShell 7.3+).
+warning is added if it disagrees with the `Host` header); obs-folded headers (unfolded per RFC); a
+header name that isn't a valid RFC 7230 field-name token (passed through verbatim — servers may
+reject or ignore such a header line); a header value made only of whitespace (curl cannot reproduce
+a pure-OWS field value, sent as an empty header); asterisk-form `OPTIONS *` (target sent verbatim
+via `--request-target`, requires curl ≥ 7.55); duplicate `Content-Length` with identical values
+(ignored); `Content-Length` disagreeing with the actual body byte count (declared > actual suggests
+a truncated body — a more explicit hint; curl recomputes from the actual length; when the excess is
+exactly a trailing LF/CRLF, the warning calls out the likely paste artifact); non-numeric
+`Content-Length` (curl computes from the body); unrecognized HTTP version with `-i` (no version flag
+emitted); non-ASCII URL characters (percent-encoded as UTF-8); Basic credentials decoding to
+non-ASCII bytes (outside the usual `user:password` range; RFC 7617 doesn't specify an encoding, so
+the `Authorization` header is passed through verbatim instead of guessing); `Transfer-Encoding` and
+`Content-Length` both present (a request smuggling signature; curl recomputes CL from the actual
+body and sends it alongside the TE headers); `GET` / `HEAD` with a body (curl's `--data-raw` would
+switch the method to POST, and `--head` conflicts with a body, so `--request GET` / `--request HEAD`
+is added to keep the method — some servers/proxies reject such requests); `{}` / `[]` in the URL
+path/query (curl treats these as glob metacharacters by default: `{a,b}` sends multiple requests and
+`[abc]` errors out; `--globoff` is appended to send them literally, without percent-encoding,
+keeping the wire format unchanged); argument values containing double quotes under the PowerShell
+dialect (Windows PowerShell 5.1 mangles such arguments when invoking native executables; the command
+requires PowerShell 7.3+).
 
 - **Method**: `HEAD` → `--head`; `GET` → default; `POST` → `--data-raw`; others → `--request`
   (original case preserved)
@@ -228,10 +234,16 @@ mangles such arguments when invoking native executables; the command requires Po
   user's local `~/.curlrc` so that local config (proxy, headers, auth, ...) cannot change the
   request's semantics — the command stays self-contained
 - **URL**: `{https|http}://{Host}{path}`; non-ASCII characters are percent-encoded as UTF-8 with a
-  warning. When the request line is absolute-form (`GET http://host/path HTTP/1.1` — the full URL
-  written into the request line; RFC 7230 requires this form when clients send requests via a proxy,
-  and requests pasted from mitmproxy/Burp/proxy logs often look like this), that URL is used
-  directly
+  warning; a path containing dot-segments (`/./` or `/../`) gets `--path-as-is` so curl sends the
+  request line verbatim instead of squashing them. When the request line is absolute-form
+  (`GET
+  http://host/path HTTP/1.1` — the full URL written into the request line; RFC 7230 requires
+  this form when clients send requests via a proxy, and requests pasted from mitmproxy/Burp/proxy
+  logs often look like this), that URL is used directly
+- **Empty headers**: an original header with an empty value (`X-Empty:`) is emitted with curl's
+  semicolon form `-H 'X-Empty;'` — the colon form `-H 'X-Empty:'` would tell curl to _remove_ the
+  header, which is exactly what the synthetic suppression headers (`User-Agent:`, `Accept:`,
+  `Content-Type:`) rely on. Wire-verified: `-H 'X-Empty;'` sends `X-Empty:`.
 
 ### chunked Transfer-Encoding is refused
 
@@ -248,13 +260,14 @@ Therefore chunked requests are **refused**:
 
 Retry with a `Content-Length` body instead.
 
-### Binary bodies are refused
+### Binary bytes are refused
 
 Shell arguments cannot carry arbitrary bytes: non-UTF-8 sequences have already been replaced by
-U+FFFD during pasting/decoding, and NUL bytes cannot pass through a shell at all. When the body
-contains U+FFFD replacement characters, conversion is **refused** (CLI: stderr + exit code 1 / Web:
-orange notice), instead of silently producing a command that sends wrong data. Extract the body into
-a file and use `--data-binary @file` manually.
+U+FFFD during pasting/decoding, and NUL bytes cannot pass through a shell at all. When the input
+(request line, headers, or body) contains U+FFFD replacement characters or NUL bytes anywhere,
+conversion is **refused** (CLI: stderr + exit code 1 / Web: orange notice), instead of silently
+producing a command that sends wrong data. If the body is binary, extract it into a file and use
+`--data-binary @file` manually.
 
 ### CONNECT and asterisk-form
 

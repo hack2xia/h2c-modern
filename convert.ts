@@ -165,6 +165,13 @@ function parse(input: string): ParseResult {
         `header name "${rawName}" has surrounding whitespace; stripped (RFC 7230 field-name does not allow whitespace)`,
       );
     }
+    // field-name 必须整体是 token；含非法字符（空格/非 ASCII 等）的头名透传后服务端
+    // 可能整行忽略——不能忠实表达，提醒用户自行核实
+    if (!/^[0-9A-Za-z!#$%&'*+\-.^_`|~]+$/.test(rawName.trim())) {
+      warnings.push(
+        `header name "${rawName}" is not a valid RFC 7230 field-name token; passing it through verbatim — servers may reject or ignore this header line`,
+      );
+    }
     headers.push({
       name: rawName.trim(),
       // value 原样保留：包含冒号后的所有字节（含前导/后导 OWS）。
@@ -301,6 +308,23 @@ export function convert(httpText: string, options: Options = {}): ConvertResult 
     ? (s: string): string => "'" + s.replaceAll("'", "''") + "'"
     : shQuote;
 
+  // NUL 字节：shell argv 无法承载 NUL，输入任何位置出现都无法忠实表达，拒绝
+  // （README 已声明 NUL 无法通过 shell，这里把承诺落到实现）。
+  if (httpText.includes('\0')) {
+    throw new Error(
+      'input contains NUL bytes; shell arguments cannot carry NUL, so a faithful conversion is impossible. Refusing to convert.',
+    );
+  }
+  // U+FFFD 替换字符（请求行 / header / body 任一位置）：输入是已解码的字符串，替换字符
+  // 意味着原始报文里有二进制/非 UTF-8 字节（粘贴/解码过程已损坏）。shell 参数无法承载
+  // 任意字节，生成的命令必然发送错误数据，拒绝；建议把 body 提取为文件后手动用
+  // --data-binary @文件。
+  if (httpText.includes('\uFFFD')) {
+    throw new ConvertWarning(
+      'input contains U+FFFD replacement characters — the original message most likely contains binary or non-UTF-8 bytes that were already corrupted during pasting/decoding. Shell arguments cannot carry arbitrary bytes; refusing to convert. If the body is binary, extract it into a file and use --data-binary @file manually.',
+    );
+  }
+
   const { req, warnings } = parse(httpText);
   const method = req.method.toUpperCase();
 
@@ -309,15 +333,6 @@ export function convert(httpText: string, options: Options = {}): ConvertResult 
   if (method === 'CONNECT') {
     throw new ConvertWarning(
       'CONNECT is a proxy tunnel control message; a single curl command cannot express tunnel semantics (reproduce the traffic with --proxy options instead). Refusing to convert.',
-    );
-  }
-
-  // 请求体含 U+FFFD 替换字符：输入是已解码的字符串，替换字符意味着原始报文里有
-  // 二进制/非 UTF-8 字节（粘贴/解码过程已损坏）。shell 参数无法承载任意字节，
-  // 生成的命令必然发送错误数据，拒绝；建议提取 body 为文件后手动用 --data-binary @文件。
-  if (req.body.includes('\uFFFD')) {
-    throw new ConvertWarning(
-      'body contains U+FFFD replacement characters — the original message most likely contains binary or non-UTF-8 bytes that were already corrupted during pasting/decoding. Shell arguments cannot carry arbitrary bytes; refusing to convert. Extract the body into a file and use --data-binary @file manually.',
     );
   }
 
@@ -578,7 +593,7 @@ export function convert(httpText: string, options: Options = {}): ConvertResult 
   if (encodingConsumed) consumed.add('accept-encoding');
   if (authConsumed) consumed.add('authorization');
 
-  // 默认头抑制
+  // 默认头抑制（合成的空头恒用 colon 形式——正是利用 curl "空值即删除" 的语义来清默认值）
   if (!opts.allowDefaultHeaders) {
     if (uaValues.length === 0) {
       args.push(opt('--header', '-H'), q('User-Agent:'));
@@ -591,6 +606,22 @@ export function convert(httpText: string, options: Options = {}): ConvertResult 
   for (const h of req.headers) {
     const key = h.name.toLowerCase();
     if (alwaysSkip.has(key) || consumed.has(key)) continue;
+    // 空值 header（原始行 "Name:"）：-H 'Name:' 会被 curl 当作"删除/抑制该头"而非发送，
+    // 与合成抑制头同语义会静默丢头。curl 的分号形式 -H 'Name;' 才会在线上发出 "Name:"
+    // （8.x 实测逐字节一致），空值头一律用它。
+    if (h.value === '') {
+      args.push(opt('--header', '-H'), q(`${h.name};`));
+      continue;
+    }
+    // 值仅由 OWS 组成（如 "Name: " / "Name:\t"）：curl -H 会剥掉尾随空白并把剩余空串当
+    // 删除处理，无法复现纯 OWS 的 field-value——退化为空值发送并提醒。
+    if (h.value.trim() === '') {
+      args.push(opt('--header', '-H'), q(`${h.name};`));
+      warnings.push(
+        `header "${h.name}" has a field-value made only of whitespace; curl cannot reproduce trailing OWS in a header value — sending it as an empty header (${h.name};)`,
+      );
+      continue;
+    }
     // 不插入空格：value 已原样保留冒号后所有字节（含前导 OWS），
     // 由 curl 直接发送 `-H 'Name: value'` / `-H 'Name:value'` / `-H 'Name:  value'` 等形态。
     args.push(opt('--header', '-H'), q(`${h.name}:${h.value}`));
@@ -636,6 +667,14 @@ export function convert(httpText: string, options: Options = {}): ConvertResult 
 
   // 10. URL：非 ASCII 字符按 UTF-8 百分号编码（request-target 按规范只能是 ASCII；
   // 未编码字节 curl 会原样发出，多数服务器也能容忍，但严格场景下 wire format 不合法）
+  // request-target 含裸 #（fragment）：RFC 7230 §5.4 规定 target URI 不得含 fragment，
+  // 且 curl 会把 # 及其后内容当 URL fragment 丢弃，请求行里不会出现（实测 --path-as-is
+  // 也无效）——静默转换必然丢字节，属明显错误，拒绝。
+  if (req.path.includes('#')) {
+    throw new Error(
+      `request-target "${req.path}" contains a fragment (#); HTTP request targets must not contain fragments and curl would silently drop it from the request line. Remove the fragment and retry.`,
+    );
+  }
   const rawUrl = absoluteForm
     ? req.path
     : `${opts.useHttp ? 'http' : 'https'}://${host}${asteriskForm ? '' : req.path}`;
@@ -649,14 +688,18 @@ export function convert(httpText: string, options: Options = {}): ConvertResult 
   const authorityIdx = url.indexOf('://');
   const afterAuthority = authorityIdx === -1 ? url : url.slice(authorityIdx + 3);
   const pathOrQueryIdx = afterAuthority.search(/[/?#]/);
-  const pathAndQuery = pathOrQueryIdx === -1
-    ? ''
-    : afterAuthority.slice(pathOrQueryIdx).split('#')[0];
+  const pathAndQuery = pathOrQueryIdx === -1 ? '' : afterAuthority.slice(pathOrQueryIdx);
   if (/[\[\]{}]/.test(pathAndQuery)) {
     args.push(opt('--globoff', '-g'));
     warnings.push(
       'URL path/query contains [] or {} (curl glob metacharacters); added --globoff to send them literally (not percent-encoded, wire format unchanged)',
     );
+  }
+  // dot-segment（/./ /../ 结尾的 /. /..）：curl 默认按标准折叠（/a/../b → /b，
+  // 实测 /a//b 不折叠）——路由/缓存研究里这类边界正是关键；--path-as-is 让 curl
+  // 原样发送请求行。只在实际含 dot-segment 时追加，普通路径不受影响。
+  if (/\/\.{1,2}(\/|$)/.test(pathAndQuery)) {
+    args.push('--path-as-is');
   }
   if (asteriskForm) {
     args.push('--request-target', q('*'));

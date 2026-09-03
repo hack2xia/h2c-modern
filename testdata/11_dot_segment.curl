@@ -1,0 +1,1 @@
+curl --disable --header 'User-Agent:' --header 'Accept:' --header 'X-Custom: keep' --path-as-is 'https://example.com/v1/../admin'
