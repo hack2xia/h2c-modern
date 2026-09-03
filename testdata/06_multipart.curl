@@ -1,1 +1,9 @@
-curl --header 'User-Agent:' --header 'Accept:' --form 'name=moo' --form 'file=@README.md' 'https://example.com/upload'
+curl --disable --header 'User-Agent:' --header 'Accept:' --header 'Content-Type: multipart/form-data; boundary=----WebKitFormBoundary' --data-raw '------WebKitFormBoundary
+Content-Disposition: form-data; name="name"
+
+moo
+------WebKitFormBoundary
+Content-Disposition: form-data; name="file"; filename="README.md"
+
+hello
+------WebKitFormBoundary--' 'https://example.com/upload'

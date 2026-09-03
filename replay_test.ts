@@ -1,18 +1,18 @@
 // h2c-modern 回放测试：夹具生成的 curl 命令真实执行到本地回显服务器，
 // 对比线上字节与原始报文——防止"生成正确"与"发送正确"脱节
-// （如 --data-binary 触发 curl 注入默认 Content-Type，这类问题只有回放能暴露）。
+// （如 --data-raw 触发 curl 注入默认 Content-Type，这类问题只有回放能暴露）。
 //
 // 归一化（双方同规则应用，不弱化断言）：
-// - 行尾 LF → CRLF（夹具为 LF 文本，curl 恒发 CRLF）
+// - 行尾 LF → CRLF（夹具为 LF 文本，curl 恒发 CRLF；body 内部换行同样归一化）
 // - Host 值（回放指向 127.0.0.1 随机端口）
 // - Accept-Encoding 值（--compressed 由 curl 按构建生成编码列表，属文档化的有损映射）
 // - Content-Length 行整体剔除：本工具把 CL 交给 curl 按实际 body 重算（原报文有/无、
 //   值对/错都会被替换），body 字节一致性已单独校验，足以覆盖长度错误
 // - HTTP 版本 token（版本保真由 -i 选项管辖，回放不启用；04 夹具请求行为 HTTP/2）
-// - multipart 夹具单独校验：curl 重新生成 boundary（body 必然不同），退化为逐 part
-//   比对（name / filename / part 级 Content-Type / body）；真 filename part 的 @file
-//   引用重定向到内容等同原报文的临时文件（保持 curl 真实读文件路径可回放，不依赖
-//   仓库文件），--form-string 的字面值（可能恰好以 @ 开头）与普通字段值原样保留
+// - Expect 头（curl 对较大 body 自动附加 Expect: 100-continue，是传输层提示，
+//   与请求语义无关；服务器端已回 100 让 body 正常发出）
+// multipart 夹具无需特殊比对：body 经 --data-raw 整体字面发送（含原始 boundary 与
+// 全部 part 头），Content-Type 头原样透传，走与普通请求相同的归一化比对即可。
 import { assert, assertEquals } from 'jsr:@std/assert@^1.0.19';
 import { convert } from './convert.ts';
 
@@ -60,69 +60,6 @@ function concatBytes(chunks: Uint8Array[]): Uint8Array {
   return out;
 }
 
-/** multipart 报文中的一个 part（回放比对用） */
-interface ReplayPart {
-  name: string;
-  filename?: string;
-  contentType?: string;
-  body: string;
-}
-
-/** 从 multipart 报文文本提取各 part，行尾统一为 CRLF（夹具 LF / 线上 CRLF 可比） */
-function extractParts(message: string): ReplayPart[] {
-  const text = message.replace(/\r?\n/g, '\r\n');
-  const headEnd = text.indexOf('\r\n\r\n');
-  const head = headEnd === -1 ? text : text.slice(0, headEnd);
-  const body = headEnd === -1 ? '' : text.slice(headEnd + 4);
-  const ctLine = head.split('\r\n').find((l) => /^content-type:/i.test(l)) ?? '';
-  const m = /boundary=("?)([^";\s]+)\1/i.exec(ctLine);
-  if (!m) return [];
-  const parts: ReplayPart[] = [];
-  for (const seg of body.split('--' + m[2])) {
-    const part = seg.replace(/^\r\n/, '').replace(/\r\n$/, '');
-    if (!part || part === '--') continue;
-    const sep = part.indexOf('\r\n\r\n');
-    if (sep === -1) continue; // preamble / epilogue / 截断
-    const headLines = part.slice(0, sep).split('\r\n');
-    const cd = headLines.find((l) => /^content-disposition:/i.test(l)) ?? '';
-    const partCT = headLines.find((l) => /^content-type:/i.test(l));
-    parts.push({
-      name: /name="([^"]*)"/i.exec(cd)?.[1] ?? '',
-      filename: /filename="([^"]*)"/i.exec(cd)?.[1],
-      contentType: partCT?.replace(/^content-type:[ \t]*/i, '').replace(/[ \t]+$/, ''),
-      body: part.slice(sep + 4),
-    });
-  }
-  return parts;
-}
-
-/** 逐 part 比对 multipart 报文：name / filename / body 一致；Content-Type 对字符串
- * part 严格一致（curl 不额外注入），file part 仅在原 part 显式声明时校验（未声明时
- * curl 按扩展名猜测，属文档化的有损映射） */
-function assertPartsEqual(wire: string, want: string, label: string) {
-  const wireParts = extractParts(wire);
-  const wantParts = extractParts(want);
-  assertEquals(wireParts.length, wantParts.length, `${label}: part 数量`);
-  for (let i = 0; i < wantParts.length; i++) {
-    assertEquals(wireParts[i].name, wantParts[i].name, `${label}: part ${i} name`);
-    assertEquals(
-      wireParts[i].filename,
-      wantParts[i].filename,
-      `${label}: part ${i} filename`,
-    );
-    assertEquals(wireParts[i].body, wantParts[i].body, `${label}: part ${i} body`);
-    if (
-      wantParts[i].filename === undefined || wantParts[i].contentType !== undefined
-    ) {
-      assertEquals(
-        wireParts[i].contentType,
-        wantParts[i].contentType,
-        `${label}: part ${i} content-type`,
-      );
-    }
-  }
-}
-
 function indexOfSeq(hay: Uint8Array, needle: number[]): number {
   outer:
   for (let i = 0; i <= hay.length - needle.length; i++) {
@@ -167,7 +104,7 @@ async function readFullRequest(conn: Deno.Conn): Promise<Uint8Array> {
   return concatBytes(chunks);
 }
 
-/** 归一化：行尾 CRLF、Host / Accept-Encoding 值占位、CL 行剔除、HTTP 版本占位；
+/** 归一化：行尾 CRLF、Host / Accept-Encoding 值占位、CL / Expect 行剔除、HTTP 版本占位；
  * header 行排序后比对 */
 function normalizeWire(bytes: Uint8Array): string {
   let text = dec.decode(bytes);
@@ -180,6 +117,7 @@ function normalizeWire(bytes: Uint8Array): string {
   const headers = lines.slice(1)
     .filter((l) => l.trim() !== '')
     .filter((l) => !/^Content-Length:/i.test(l)) // curl 恒按实际 body 重算，见文件头注释
+    .filter((l) => !/^Expect:/i.test(l)) // curl 对较大 body 自动附加，传输层提示，见文件头注释
     .map((l) =>
       l.replace(/^Host:.*$/i, 'Host: NORM')
         .replace(/^Accept-Encoding:.*$/i, 'Accept-Encoding: NORM')
@@ -189,8 +127,6 @@ function normalizeWire(bytes: Uint8Array): string {
 }
 
 Deno.test('replay: 夹具生成的命令实际发送的字节与原始报文一致', async () => {
-  // multipart 的 @file part 写入临时文件：curl 走真实读文件路径，body/filename 均可比对
-  const tmpDir = await Deno.makeTempDir({ prefix: 'h2c-replay-' });
   const listener = Deno.listen({ hostname: '127.0.0.1', port: 0 });
   const port = (listener.addr as Deno.NetAddr).port;
   const RESP_OK = 'HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok';
@@ -235,30 +171,9 @@ Deno.test('replay: 夹具生成的命令实际发送的字节与原始报文一�
         `http://127.0.0.1:${port}`,
       );
 
-      // multipart 检测按报文自身的 CT 头，不依赖夹具名
-      const isMultipart = /^content-type: multipart\/form-data/im.test(raw);
-      // 真 filename part（--form 的 name=@file）依赖本地文件：把原报文该 part 的
-      // body 写入临时文件、@引用重定向过去；--form-string 的字面值（可能恰好以 @
-      // 开头）与普通字段值原样保留，不做替换
-      let fileMap: Map<string, string> | undefined;
-      if (isMultipart) {
-        fileMap = new Map();
-        for (const p of extractParts(raw)) {
-          if (p.filename !== undefined && !fileMap.has(p.filename)) {
-            const f = `${tmpDir}/${p.filename}`;
-            Deno.writeTextFileSync(f, p.body);
-            fileMap.set(p.filename, f);
-          }
-        }
-      }
       const args = ['-s', '--max-time', '5'];
       for (let i = 1; i < parsed.length - 1; i++) {
-        let a = parsed[i];
-        if (fileMap && (parsed[i - 1] === '--form' || parsed[i - 1] === '-F')) {
-          const m = /^([^=]+)=@([^;]+)(;.*)?$/.exec(a);
-          if (m && fileMap.has(m[2])) a = `${m[1]}=@${fileMap.get(m[2])}${m[3] ?? ''}`;
-        }
-        args.push(a);
+        args.push(parsed[i]);
       }
       args.push(parsed[parsed.length - 1]);
 
@@ -276,28 +191,10 @@ Deno.test('replay: 夹具生成的命令实际发送的字节与原始报文一�
       const received = receivedQueue.shift();
       if (received === undefined) throw new Error(`${name}: 回显服务器未收到请求`);
 
-      if (isMultipart) {
-        // boundary 由 curl 重新生成，无法整体比对：请求行 + CT 形态单独校验，
-        // 其余退化为逐 part 比对（name / filename / part 级 CT / 字符串 part 的 body）
-        const head = dec.decode(received).split('\r\n\r\n')[0];
-        const lines = head.split('\r\n');
-        assertEquals(
-          lines[0].replace(/HTTP\/[\w.]+$/, 'HTTP/NORM'),
-          raw.split(/\r?\n/)[0].replace(/HTTP\/[\w.]+$/, 'HTTP/NORM'),
-          `${name}: 请求行`,
-        );
-        assert(
-          lines.some((l) => /^content-type: multipart\/form-data; boundary=/i.test(l)),
-          `${name}: 缺少 multipart Content-Type`,
-        );
-        assertPartsEqual(dec.decode(received), raw, name);
-      } else {
-        assertEquals(normalizeWire(received), normalizeWire(enc.encode(raw)), name);
-      }
+      assertEquals(normalizeWire(received), normalizeWire(enc.encode(raw)), name);
     }
   } finally {
     listener.close();
     await server;
-    await Deno.remove(tmpDir, { recursive: true });
   }
 });

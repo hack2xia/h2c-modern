@@ -74,7 +74,7 @@ On top of fixture comparison there is a **replay test** (`replay_test.ts`): each
 curl command is actually executed against a local echo server (127.0.0.1, random port; requires curl
 on the machine), and the bytes received on the wire are compared with the original message. This
 catches problems where the command _looks_ right but the wire bytes are wrong — for example curl
-injecting a default `Content-Type` for `--data-binary`.
+injecting a default `Content-Type` for `--data-raw`.
 
 ## Build
 
@@ -152,7 +152,7 @@ request, when browsers refuse to load the ES module).
 
 | CLI option                    | Web             | Description                                              |
 | ----------------------------- | --------------- | -------------------------------------------------------- |
-| `-s, --short`                 | Short options   | `-H` `-b` `-A` `-u` `-I` `-X` `-v` `-F`                  |
+| `-s, --short`                 | Short options   | `-H` `-A` `-u` `-I` `-X` `-v`                            |
 | `-v, --verbose`               | verbose         | append `--verbose`                                       |
 | `-a, --allow-default-headers` | Default headers | do not suppress `Accept` / `User-Agent`                  |
 | `-i, --same-http-version`     | HTTP version    | append `--http1.1` / `--http2`                           |
@@ -166,13 +166,17 @@ request, when browsers refuse to load the ES module).
 to stderr and don't affect piping; Web: shown below the output, not part of the copyable text).
 
 Refused (clear errors / impossible to express faithfully): empty request; request line that isn't
-`METHOD target [HTTP/x]` in two or three tokens; invalid request-target form (not starting with `/`
-and not absolute-form / asterisk-form — e.g. bare `foo` or authority-form on a non-CONNECT method;
-asterisk-form is only valid for `OPTIONS`); header line without a colon; a bare CR inside the header
-section (CR is only valid as part of CRLF — a request smuggling vector); missing `Host` (unless
-absolute-form); multiple `Host` headers; duplicate `Content-Length` with different values (an HTTP
-request smuggling signature); `Transfer-Encoding: chunked`; unparseable multipart (missing boundary,
-no parts found, a part without Content-Disposition, or a truncated part); body containing binary /
+`METHOD target [HTTP/x]` in two or three tokens; a method that isn't a valid RFC token (tchar — e.g.
+injection payloads containing semicolons or parentheses); invalid request-target form (not starting
+with `/` and not absolute-form / asterisk-form — e.g. bare `foo` or authority-form on a non-CONNECT
+method; asterisk-form is only valid for `OPTIONS`); header line without a colon; a bare CR inside
+the header section (CR is only valid as part of CRLF — a request smuggling vector); missing `Host`
+(unless absolute-form); multiple `Host` headers; a `Host` that isn't a valid authority (userinfo
+`@`, path/query/fragment characters, out-of-range or non-numeric port, unbracketed IPv6 — such
+values would be reinterpreted by the URL parser once concatenated into the URL, causing target host
+confusion); duplicate `Content-Length` with different values (an HTTP request smuggling signature);
+`Transfer-Encoding: chunked` (all same-name headers and comma tokens are checked — `TE: gzip` +
+`TE: chunked` or a single `TE: gzip, chunked` is refused as well); body containing binary /
 non-UTF-8 bytes (U+FFFD replacement characters); `CONNECT` (proxy tunnel control message).
 
 Generated + warning (questionable): absolute-form request line (the URL is used directly; an extra
@@ -185,36 +189,44 @@ out the likely paste artifact); non-numeric `Content-Length` (curl computes from
 unrecognized HTTP version with `-i` (no version flag emitted); non-ASCII URL characters
 (percent-encoded as UTF-8); Basic credentials decoding to non-ASCII bytes (outside the usual
 `user:password` range; RFC 7617 doesn't specify an encoding, so the `Authorization` header is passed
-through verbatim instead of guessing); `GET` / `HEAD` with a body (curl's `--data-binary` would
-switch the method to POST, and `--head` conflicts with a body, so `--request GET` / `--request HEAD`
-is added to keep the method — some servers/proxies reject such requests); `{}` / `[]` in the URL
-path/query (curl treats these as glob metacharacters by default: `{a,b}` sends multiple requests and
-`[abc]` errors out; `--globoff` is appended to send them literally, without percent-encoding,
-keeping the wire format unchanged); argument values containing double quotes under the PowerShell
-dialect (Windows PowerShell 5.1 mangles such arguments when invoking native executables; the command
-requires PowerShell 7.3+).
+through verbatim instead of guessing); `Transfer-Encoding` and `Content-Length` both present (a
+request smuggling signature; curl recomputes CL from the actual body and sends it alongside the TE
+headers); `GET` / `HEAD` with a body (curl's `--data-raw` would switch the method to POST, and
+`--head` conflicts with a body, so `--request GET` / `--request HEAD` is added to keep the method —
+some servers/proxies reject such requests); `{}` / `[]` in the URL path/query (curl treats these as
+glob metacharacters by default: `{a,b}` sends multiple requests and `[abc]` errors out; `--globoff`
+is appended to send them literally, without percent-encoding, keeping the wire format unchanged);
+argument values containing double quotes under the PowerShell dialect (Windows PowerShell 5.1
+mangles such arguments when invoking native executables; the command requires PowerShell 7.3+).
 
-- **Method**: `HEAD` → `--head`; `GET` → default; `POST` → `--data-binary`; others → `--request`
-- **Body**: normal → `--data-binary`; a bodyless request that declared `Content-Length: 0` (POST/PUT
-  etc.) → `--data-binary ''` so curl actually sends that header (except GET/HEAD — it would change
-  the method / conflict with `--head`, so nothing is sent); `multipart/form-data` → parsed into
-  multiple `--form`
-- **Special headers**: `User-Agent` → `--user-agent`; `Cookie` → `--cookie`; `Authorization: Basic`
-  → `--user`; `Accept-Encoding` containing gzip/deflate/br/zstd → `--compressed`
-- **Skipped headers**: `Host` (used for the URL), `Content-Length` (curl computes it), multipart
-  `Content-Type`
-- **Duplicate headers**: a special header (`Cookie` / `User-Agent` / `Authorization` /
-  `Accept-Encoding`) uses its dedicated option only when it appears exactly once; **when duplicated,
-  every occurrence is passed through as `-H` in original order**. Duplicates may be part of the
-  request semantics (security tools deliberately construct them), and servers don't necessarily
-  treat same-name headers as equivalent per RFC — passing each line through is the only way to keep
-  the wire format unchanged (`-H` suppresses curl-internal headers from `-b` / `-A`, so dedicated
-  options are not mixed in when duplicated)
+- **Method**: `HEAD` → `--head`; `GET` → default; `POST` → `--data-raw`; others → `--request`
+  (original case preserved)
+- **Body**: normal → `--data-raw` (byte-for-byte equivalent to `--data-binary`, but **without curl's
+  `@file` metasyntax** — otherwise a body starting with `@` would be read from the local filesystem
+  and uploaded, see below); a bodyless request that declared `Content-Length: 0` (POST/PUT etc.) →
+  `--data-raw ''` so curl actually sends that header (except GET/HEAD — it would change the method /
+  conflict with `--head`, so nothing is sent); `multipart/form-data` → also sent as a whole via
+  `--data-raw` with the `Content-Type` header passed through verbatim (see below)
+- **Special headers**: `User-Agent` → `--user-agent`; `Authorization: Basic` → `--user`;
+  `Accept-Encoding` containing gzip/deflate/br/zstd → `--compressed`; `Cookie` always goes through
+  `-H` (curl interprets a `--cookie` argument without `=` as a **filename** and tries to read a
+  local cookie file — an unnecessary local file read and credential risk)
+- **Skipped headers**: `Host` (used for the URL), `Content-Length` (curl computes it)
+- **Duplicate headers**: a special header (`User-Agent` / `Authorization` / `Accept-Encoding`) uses
+  its dedicated option only when it appears exactly once; **when duplicated, every occurrence is
+  passed through as `-H` in original order**. Duplicates may be part of the request semantics
+  (security tools deliberately construct them), and servers don't necessarily treat same-name
+  headers as equivalent per RFC — passing each line through is the only way to keep the wire format
+  unchanged (`-H` suppresses curl-internal headers from `-A`, so dedicated options are not mixed in
+  when duplicated)
 - **Default header suppression**: if the request lacks `Accept` / `User-Agent` and default headers
   are not allowed, `-H 'Accept:'` / `-H 'User-Agent:'` is appended to clear curl's defaults.
-  Likewise, `--data-binary` makes curl inject a default
+  Likewise, `--data-raw` makes curl inject a default
   `Content-Type: application/x-www-form-urlencoded`: if the original request has no `Content-Type`,
   `-H 'Content-Type:'` is appended to clear it
+- **curl config isolation**: the generated command starts with `--disable` (`-q`), which skips the
+  user's local `~/.curlrc` so that local config (proxy, headers, auth, ...) cannot change the
+  request's semantics — the command stays self-contained
 - **URL**: `{https|http}://{Host}{path}`; non-ASCII characters are percent-encoded as UTF-8 with a
   warning. When the request line is absolute-form (`GET http://host/path HTTP/1.1` — the full URL
   written into the request line; RFC 7230 requires this form when clients send requests via a proxy,
@@ -225,7 +237,7 @@ requires PowerShell 7.3+).
 
 `Transfer-Encoding: chunked` is **streaming semantics** — the server may depend on chunk boundaries
 (streaming uploads, large bodies arriving in batches), while a curl command line sends everything at
-once and cannot express that faithfully. Decoding and switching to `--data-binary` would change the
+once and cannot express that faithfully. Decoding and switching to `--data-raw` would change the
 wire format, and command lines are length-limited (chunked is usually used precisely because the
 body is large).
 
@@ -252,37 +264,28 @@ a file and use `--data-binary @file` manually.
   URL carries only the authority), with a warning (requires curl ≥ 7.55). asterisk-form is only
   valid for the `OPTIONS` method; any other method with a `*` target is rejected outright.
 
-### multipart `--form` behavior
+### multipart body is sent verbatim
 
-`multipart/form-data` requests are converted into multiple `--form` arguments:
+`multipart/form-data` requests are **never parsed or reconstructed**: the body is sent as a whole
+via `--data-raw` and the `Content-Type` header (including the original boundary) is passed through
+verbatim as a normal header — the wire bytes are identical to the original message, with no
+dependency on any local file.
 
-- plain fields → `name=value`; when the value would be misparsed by `--form`'s value syntax,
-  `--form-string` is used instead (see below)
-- **fields with `filename` → `name=@filename`** (plus `;type=<ct>` when the part declares a
-  Content-Type)
+Deliberately not using a `--form` reconstruction, for two reasons:
 
-`--form`'s value syntax specially interprets a **leading `@` / `<` (read a local file) and embedded
-`;type=` / `;filename=` / `;encoder=` / `;headers=` directives**: a field value `@bruce` makes curl
-try to read a file named `bruce` (the command just fails), and `hello;filename=x` gets rewritten
-into the Content-Disposition — the literal value is silently changed. Such values are therefore sent
-with `--form-string` (fully literal, wire-identical; no short option, requires curl ≥ 7.43). The
-cost: `--form-string` parses no directives, so a part-level `Content-Type` cannot be attached — when
-the two conflict, value fidelity wins, the `;type=` is dropped, and a warning is emitted.
+1. `--form` makes curl **regenerate the boundary and rebuild the entire body** — it was never wire
+   equivalent. A hand-written MIME parser also silently truncates bodies that happen to contain a
+   boundary substring or lack a closing delimiter, and drops part headers.
+2. A part's remote `filename` would be mapped to `name=@local-path` — curl would then **read and
+   upload a local file** instead of the bytes from the original request body, creating a local file
+   read / exfiltration path.
 
-`@filename` is curl syntax: it makes curl **read the content from a local file** instead of sending
-the bytes from the original request body. In other words, the generated command depends on a local
-file of that name existing. To use the original body content, manually change `@filename` to the
-inline form, or use `--data-binary` with the raw body.
+Part-level `Content-Type`, `Content-Transfer-Encoding`, custom part headers, etc. are therefore all
+preserved as-is. The only cost is readability: the command contains the full raw body rather than
+structured `--form` arguments.
 
-This matches the original [curl/h2c](https://github.com/curl/h2c) behavior.
-
-A part-level `Content-Type` is preserved as `;type=` in the generated `--form`; without it curl
-guesses by file extension or falls back to `application/octet-stream`, changing the wire format.
-
-If `Content-Type` declares multipart but the `boundary` is missing, no parts can be parsed with the
-boundary, a part lacks its Content-Disposition header, or a part looks truncated, h2c **refuses to
-convert** (warning + exit code 1 / orange notice on the web) rather than silently producing a
-command that loses parts of the body. Check that the original request is complete.
+Bodies containing binary / non-UTF-8 bytes (U+FFFD) are still refused — extract the body into a file
+and use `--data-binary @file` manually (copy the `Content-Type` header from the original message).
 
 ## License
 

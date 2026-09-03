@@ -70,7 +70,7 @@ deno task lint
 
 除夹具比对外还有**回放测试**（`replay_test.ts`）：把每个夹具生成的 curl 命令真实执行到本地
 回显服务器（127.0.0.1 随机端口，需本机装有 curl），对比实际收到的字节与原始报文——能抓住
-"命令看起来对、线上字节不对"的问题，例如 curl 对 `--data-binary` 自动注入的默认 `Content-Type`。
+"命令看起来对、线上字节不对"的问题，例如 curl 对 `--data-raw` 自动注入的默认 `Content-Type`。
 
 ## 构建
 
@@ -144,7 +144,7 @@ CI 会构建镜像并对运行中的容器做冒烟测试——页面、静态�
 
 | 选项（CLI）                   | Web             | 说明                                          |
 | ----------------------------- | --------------- | --------------------------------------------- |
-| `-s, --short`                 | Short options   | `-H` `-b` `-A` `-u` `-I` `-X` `-v` `-F`       |
+| `-s, --short`                 | Short options   | `-H` `-A` `-u` `-I` `-X` `-v`                 |
 | `-v, --verbose`               | verbose         | 追加 `--verbose`                              |
 | `-a, --allow-default-headers` | Default headers | 不抑制 `Accept` / `User-Agent`                |
 | `-i, --same-http-version`     | HTTP version    | 追加 `--http1.1` / `--http2`                  |
@@ -156,12 +156,15 @@ CI 会构建镜像并对运行中的容器做冒烟测试——页面、静态�
 **总原则**：请求有**明显错误** → 拒绝转换并指出错误；请求**可能有问题** → 照常生成命令， 但以非阻断
 warning 提醒（CLI 走 stderr 不影响管道，Web 显示在输出区下方，不参与复制）。
 
-拒绝（明显错误 / 无法忠实表达）：空请求、请求行不是 `METHOD target [HTTP/x]` 两到三段、 非法
-request-target 形态（不以 `/` 开头且非 absolute-form / asterisk-form，如裸 `foo` 或非 CONNECT 的
-authority-form；asterisk-form 仅限 `OPTIONS`）、 无冒号的 header 行、header 区含裸 CR（CR 仅可 作为
-CRLF 的组成部分，属请求走私向量）、缺 `Host`（absolute-form 除外）、 多个 `Host`、值不同的重复
-`Content-Length`（请求走私特征）、`Transfer-Encoding: chunked`、 multipart 无法解析（缺
-boundary、解析不出 part、part 缺 Content-Disposition 或被截断）、请求体含二进制/非 UTF-8
+拒绝（明显错误 / 无法忠实表达）：空请求、请求行不是 `METHOD target [HTTP/x]` 两到三段、 method
+不是合法 RFC token（tchar，如含分号、括号的注入载荷）、非法 request-target 形态（不以 `/` 开头且非
+absolute-form / asterisk-form，如裸 `foo` 或非 CONNECT 的 authority-form； asterisk-form 仅限
+`OPTIONS`）、 无冒号的 header 行、header 区含裸 CR（CR 仅可 作为 CRLF 的
+组成部分，属请求走私向量）、缺 `Host`（absolute-form 除外）、 多个 `Host`、`Host` 不是合法
+authority（含 userinfo `@` / 路径 / 查询 / fragment 字符、端口越界或非数字、IPv6 未 bracket
+包裹——这类值拼进 URL 后会被 URL parser 重新解释，造成目标主机混淆）、值不同的重复
+`Content-Length`（请求走私特征）、`Transfer-Encoding: chunked`（检查全部同名头的全部 逗号
+token，`TE: gzip` + `TE: chunked` 或单条 `TE: gzip, chunked` 同样拒绝）、请求体含二进制/非 UTF-8
 字节（U+FFFD 替换字符）、`CONNECT`（代理隧道控制报文）。
 
 生成 + warning（可能有问题）：absolute-form 请求行（直接使用其中 URL；与 `Host` 不一致时
@@ -171,28 +174,35 @@ boundary、解析不出 part、part 缺 Content-Disposition 或被截断）、�
 重算；多出的字节恰好是一段结尾 LF/CRLF 时，warning 会明确提示这很可能只是粘贴文本的末尾换行）、
 `Content-Length` 值非数字（curl 自动按 body 计算）、`-i` 遇到未识别的 HTTP 版本（不输出 flag）、URL
 含非 ASCII 字符（按 UTF-8 百分号编码）、 Basic 凭据解码后含非 ASCII 字节（超出 `user:password`
-常规范围；RFC 7617 未规定编码， 不猜测编码，原样透传 `Authorization` 头）、`GET` / `HEAD` 带
-body（curl 的 `--data-binary` 会把方法切成 POST、 `--head` 与 body 互斥，故追加 `--request GET` /
-`--request HEAD` 保持方法，部分服务器/代理会拒绝）、 URL 路径/查询含 `{}` / `[]`（curl
-默认把这类字符当 glob 展开：`{a,b}` 会发多个请求、`[abc]` 直接报错；追加 `--globoff`
+常规范围；RFC 7617 未规定编码， 不猜测编码，原样透传 `Authorization` 头）、`Transfer-Encoding` 与
+`Content-Length` 同时存在（请求走私特征；curl 会按实际 body 重算 CL 并与 TE 头同时发出）、`GET` /
+`HEAD` 带 body（curl 的 `--data-raw` 会把方法切成 POST、 `--head` 与 body 互斥，故追加
+`--request GET` / `--request HEAD` 保持方法，部分服务器/代理会拒绝）、 URL 路径/查询含 `{}` /
+`[]`（curl 默认把这类字符当 glob 展开：`{a,b}` 会发多个请求、`[abc]` 直接报错；追加 `--globoff`
 按字面发送，不做百分号编码，保持 wire format 不变）、PowerShell 方言下参数值含双引号（Windows
 PowerShell 5.1 向原生程序传参会破坏此类参数，命令需 PowerShell 7.3+）。
 
-- **方法**：`HEAD` → `--head`；`GET` → 默认；`POST` → `--data-binary`；其它 → `--request`
-- **请求体**：普通 → `--data-binary`；声明 `Content-Length: 0` 的无 body 请求（POST/PUT 等） →
-  `--data-binary ''` 让 curl 实际发送该头（GET/HEAD 除外——会改变方法/与 `--head` 冲突，
-  维持不发）；`multipart/form-data` → 解析为多个 `--form`
-- **特殊头**：`User-Agent` → `--user-agent`；`Cookie` → `--cookie`；`Authorization: Basic` →
-  `--user`；`Accept-Encoding` 含 gzip/deflate/br/zstd → `--compressed`
-- **跳过头**：`Host`（用于 URL）、`Content-Length`（curl 自动计算）、multipart 的 `Content-Type`
-- **重复头**：特殊头（`Cookie` / `User-Agent` / `Authorization` / `Accept-Encoding`）恰好
-  出现一次时走专属选项；**出现重复时全部按原始顺序逐条透传为 `-H`**。重复头本身可能就是
-  请求语义的一部分（安全工具常故意构造），且服务端未必按 RFC 把同名头视作等价——逐条 透传才能保持
-  wire format 不变（`-H` 与 `-b` / `-A` 混用会被 curl 抑制，故重复时专属 选项完全不用）
+- **方法**：`HEAD` → `--head`；`GET` → 默认；`POST` → `--data-raw`；其它 →
+  `--request`（保留原大小写）
+- **请求体**：普通 → `--data-raw`（与 `--data-binary` 逐字节等价，但**不解释 curl 的 `@file`
+  元语法**——否则 `@` 开头的 body 会被 curl 当本地路径读取并上传，见下文）；声明 `Content-Length: 0`
+  的无 body 请求（POST/PUT 等） → `--data-raw ''` 让 curl 实际发送该头 （GET/HEAD
+  除外——会改变方法/与 `--head` 冲突，维持不发）；`multipart/form-data` → 同样整体
+  `--data-raw`，`Content-Type` 头原样透传（见下文）
+- **特殊头**：`User-Agent` → `--user-agent`；`Authorization: Basic` → `--user`； `Accept-Encoding`
+  含 gzip/deflate/br/zstd → `--compressed`；`Cookie` 恒走 `-H`（curl 对不含 `=` 的 `--cookie`
+  参数按**文件名**解释并尝试读取本地 cookie 文件，是不必要的本地文件读取 与凭据风险）
+- **跳过头**：`Host`（用于 URL）、`Content-Length`（curl 自动计算）
+- **重复头**：特殊头（`User-Agent` / `Authorization` / `Accept-Encoding`）恰好出现一次时走专属
+  选项；**出现重复时全部按原始顺序逐条透传为 `-H`**。重复头本身可能就是请求语义的一部分（安全工具
+  常故意构造），且服务端未必按 RFC 把同名头视作等价——逐条透传才能保持 wire format 不变 （`-H` 与
+  `-A` 混用会被 curl 抑制，故重复时专属选项完全不用）
 - **默认头抑制**：若请求未含 `Accept` / `User-Agent` 且未开启允许默认头，追加 `-H 'Accept:'` /
-  `-H 'User-Agent:'` 清空 curl 默认值。同理，`--data-binary` 会触发 curl 注入默认
+  `-H 'User-Agent:'` 清空 curl 默认值。同理，`--data-raw` 会触发 curl 注入默认
   `Content-Type: application/x-www-form-urlencoded`：原请求不含 `Content-Type` 时追加
   `-H 'Content-Type:'` 清空
+- **curl 配置隔离**：生成的命令以 `--disable`（`-q`）开头，跳过用户本机的 `~/.curlrc`，防止
+  本地配置（proxy、header、认证等）改变请求语义，保证命令自包含
 - **URL**：`{https|http}://{Host}{path}`；含非 ASCII 字符时按 UTF-8 百分号编码并提醒。 请求行为
   absolute-form 时（`GET http://host/path HTTP/1.1`，完整 URL 写在请求行里， RFC 7230
   规定客户端向代理发请求时必须用这种形态，mitmproxy/Burp/代理日志里粘出来的
@@ -201,7 +211,7 @@ PowerShell 5.1 向原生程序传参会破坏此类参数，命令需 PowerShell
 ### chunked Transfer-Encoding 会被拒绝
 
 `Transfer-Encoding: chunked` 是**流式语义**——服务端可能依赖分块边界（流式上传、大 body 分批到达），
-而 curl 命令行是一次性发送，无法忠实表达这种语义。解码后改用 `--data-binary` 会改变 wire format，
+而 curl 命令行是一次性发送，无法忠实表达这种语义。解码后改用 `--data-raw` 会改变 wire format，
 且命令行长度受限（chunked 通常正是因为 body 太大才用）。
 
 因此遇到 chunked 请求会**拒绝转换**：
@@ -225,32 +235,25 @@ shell 传递。检测到请求体含 U+FFFD 替换字符时会**拒绝转换** �
   authority），并附 warning（需 curl ≥ 7.55）。asterisk-form 仅对 `OPTIONS` 方法合法，其它方法 带
   `*` target 直接拒绝。
 
-### multipart `--form` 行为说明
+### multipart 整体发送原始 body
 
-`multipart/form-data` 请求被转换为多个 `--form` 参数：
+`multipart/form-data` 请求**不做任何解析或重构**：请求体经 `--data-raw` 整体字面发送，
+`Content-Type` 头（含原始 boundary）按普通头原样透传——线上字节与原报文完全一致，不依赖
+本地任何文件。
 
-- 普通字段 → `name=value`；当值会被 `--form` 的值语法特殊解释时改用 `--form-string` 字面发送（见下）
-- **带 `filename` 的字段 → `name=@filename`**（part 声明了 Content-Type 时追加 `;type=<ct>`）
+刻意不使用 `--form` 重构方案，原因有二：
 
-`--form` 的值语法会把**前导 `@` / `<`（读本地文件）与内嵌 `;type=` / `;filename=` / `;encoder=` /
-`;headers=` 指令**特殊解释：字段值 `@bruce` 会让 curl 去读名为 bruce 的文件
-（命令直接报错），`hello;filename=x` 则被改写成 Content-Disposition 的一部分——字面值被
-静默改变。因此此类值改用 `--form-string`（完全字面发送，线上形态一致；无短选项，需 curl ≥
-7.43）。代价是 `--form-string` 不解析任何指令，无法附带 part 级 `Content-Type`——
-两者冲突时值的忠实度优先，丢弃 `;type=` 并给出 warning。
+1. `--form` 会让 curl **重新生成 boundary 并重建整个 body**，从未 wire 等价；手写 MIME
+   解析在正文恰好包含 boundary 子串、缺失 closing delimiter 等场景下还会静默截断正文、 丢失 part
+   头。
+2. part 声明的远端 `filename` 会被映射成 `name=@本地路径`——curl 转而**读取并上传本机
+   文件**，而不是原始请求体里的字节，构成一条本地文件读取/外传路径。
 
-`@filename` 是 curl 的语法，会让 curl **从本地文件读取内容上传**，而不是发送原始请求体里的字节。
-也就是说，生成的 curl 命令依赖本地存在同名文件。若想用原始请求体里的内容，请手动把 `@filename`
-改为内联形式，或直接使用 `--data-binary` 配合原始 body。
+part 级 `Content-Type`、`Content-Transfer-Encoding`、自定义 part 头等因此全部原样保留。
+代价仅是可读性：命令里是完整的原始 body 而非结构化的 `--form` 参数。
 
-这与原版 [curl/h2c](https://github.com/curl/h2c) 行为一致。
-
-part 级 `Content-Type` 会保留为生成 `--form` 的 `;type=`；不保留的话 curl 会按文件扩展名 猜测或退回
-`application/octet-stream`，改变 wire format。
-
-若 `Content-Type` 声明了 multipart 但缺少 `boundary`、按 boundary 解析不出任何 part、某 个 part 缺少
-Content-Disposition 头、或某个 part 看起来被截断，h2c 会**拒绝转换**（warning 退出码 1 / Web
-端橙色提示），而不是静默产出丢失部分请求体的命令。请检查原始请求是否完整。
+请求体含二进制/非 UTF-8 字节（U+FFFD）时依然拒绝转换——把 body 提取为文件后可手动使用
+`--data-binary @文件`（`Content-Type` 头照抄原报文即可）。
 
 ## 许可证
 

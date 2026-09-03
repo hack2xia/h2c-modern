@@ -6,7 +6,7 @@ export type ShellTarget = 'sh' | 'powershell';
 
 /** 转换选项 */
 export interface Options {
-  /** 使用短选项（-H / -b / -A / -u / -I / -X / -v / -F），默认 false */
+  /** 使用短选项（-H / -A / -u / -I / -X / -v），默认 false */
   shortOpt?: boolean;
   /** 追加 --verbose，默认 false */
   verbose?: boolean;
@@ -109,6 +109,12 @@ function parse(input: string): ParseResult {
   const path = parts[1];
   const httpVersion = parts[2] ?? 'HTTP/1.1';
 
+  // method 必须是 RFC 7230 token（tchar）：过滤含 shell 元字符的垃圾输入（如 "x;id"）。
+  // 注意校验不能替代 quote——合法 tchar 本身含 & ' ` | 等 shell 元字符，输出时仍须无条件引用。
+  if (!/^[0-9A-Za-z!#$%&'*+\-.^_`|~]+$/.test(method)) {
+    throw new Error(`invalid HTTP method: "${method}"`);
+  }
+
   // request-target 形态校验（RFC 7230 §5.3）：HTTP/1.x 只允许 origin-form（/ 开头）、
   // absolute-form（完整 URL）、asterisk-form（仅 OPTIONS）、authority-form（仅 CONNECT）。
   // 裸 "foo" 或非 CONNECT 的 authority-form 若静默拼接会产出 host/path 粘连的垃圾 URL
@@ -189,6 +195,50 @@ function getHeaderValues(headers: Header[], name: string): string[] {
   return headers.filter((h) => h.name.toLowerCase() === lower).map((h) => h.value);
 }
 
+/** 校验 Host 值是合法 HTTP authority（RFC 7230 §2.7），在拼入 URL 前把关。
+ * Host 直接拼接进 URL，含 userinfo/path 等结构字符时会被 URL parser 重新解释：
+ * "Host: trusted.example@127.0.0.1" 中 trusted.example 变成 userinfo，
+ * 实际连接主机是 127.0.0.1 —— 目标主机混淆。非法输入属明显错误，拒绝转换。
+ */
+function validateAuthority(host: string): void {
+  const fail = (why: string): never => {
+    throw new Error(`invalid Host header "${host}": ${why}`);
+  };
+  if (host.includes('@')) {
+    fail('userinfo (@) is not allowed in Host');
+  }
+  if (/[\s/?#]/.test(host)) {
+    fail('whitespace or path/query/fragment characters are not allowed in Host');
+  }
+  if (host.includes('[') || host.includes(']')) {
+    // IPv6 字面量必须整体 bracket 包裹（可带 %25zone 与可选 :port）：
+    // 不完整的 bracket（如 "[::1"）会让 URL 结构错乱
+    const m = /^\[([0-9A-Fa-f:.%]+)\](?::(\d{1,5}))?$/.exec(host);
+    if (m === null) {
+      fail('malformed IPv6 literal (expected [hex:hex] with an optional :port)');
+    } else if (m[2] !== undefined && Number(m[2]) > 65535) {
+      fail(`port ${m[2]} is out of range (0-65535)`);
+    }
+    return;
+  }
+  if (host.includes('%')) {
+    fail('% is only valid inside a bracketed IPv6 zone id');
+  }
+  const colon = host.lastIndexOf(':');
+  if (colon === -1) return; // 纯主机名（不做 DNS 语法级别的过度校验）
+  const port = host.slice(colon + 1);
+  const name = host.slice(0, colon);
+  if (!name || name.includes(':')) {
+    fail('unbracketed IPv6 or malformed host:port');
+  }
+  if (!/^\d{1,5}$/.test(port)) {
+    fail(`invalid port "${port}"`);
+  }
+  if (Number(port) > 65535) {
+    fail(`port ${port} is out of range (0-65535)`);
+  }
+}
+
 /** 单引号转义，安全用于 shell */
 function shQuote(s: string): string {
   return "'" + s.replace(/'/g, "'\\''") + "'";
@@ -210,131 +260,6 @@ function isStandardOWS(rawValue: string): boolean {
 /** 取标准 OWS 的 value：剥掉前导单个 SP（如有）。调用前应已通过 isStandardOWS 校验。 */
 function stripStandardOWS(rawValue: string): string {
   return rawValue.startsWith(' ') ? rawValue.slice(1) : rawValue;
-}
-
-/** 判断是否为 multipart/form-data 请求体 */
-function isMultipart(req: ParsedRequest): boolean {
-  const ct = getHeader(req.headers, 'content-type');
-  return !!ct && ct.toLowerCase().includes('multipart/form-data');
-}
-
-/** 一个 multipart part 对应的 curl 参数 */
-interface FormArg {
-  /** 选项参数内容（name=value / name=@file），不含选项名 */
-  content: string;
-  /**
-   * true → 必须用 --form-string 发送：--form 的值语法会把前导 @ / <（读本地文件）与
-   * 内嵌 ;type= / ;filename= / ;encoder= / ;headers= 指令特殊解释，字面值会被静默
-   * 改变（实测：'@bruce' 触发读文件报错，'hello;filename=x' 篡改 Content-Disposition）。
-   */
-  literal: boolean;
-}
-
-/** multipart 解析结果：--form 参数 + 解析阶段产生的非阻断提醒 */
-interface MultipartResult {
-  forms: FormArg[];
-  warnings: string[];
-}
-
-/** 判断 --form 的字段值是否会被 curl 值语法特殊解释，需要改用 --form-string */
-function needsFormString(value: string): boolean {
-  // 大小写不敏感宁可多触发：--form-string 对安全值也逐字面发送，线上形态一致
-  return value.startsWith('@') || value.startsWith('<') ||
-    /;(?:type|filename|encoder|headers)=/i.test(value);
-}
-
-/** 解析 multipart body，返回各 part 的 curl 参数
- * @throws 缺 boundary、解析不出任何 part、part 缺 Content-Disposition、
- *   或 part 被截断（有 CD 但无 header/body 空行）时抛 ConvertWarning——
- *   静默输出会丢失请求体语义，宁可拒绝并提示用户检查原始请求。
- */
-function parseMultipart(req: ParsedRequest): MultipartResult {
-  const ct = getHeader(req.headers, 'content-type')!;
-  const m = ct.match(/boundary=("?)([^";]+)\1/i);
-  if (!m) {
-    throw new ConvertWarning(
-      'multipart/form-data is missing the boundary parameter; cannot parse the body. Check that the original request is complete.',
-    );
-  }
-  const boundary = m[2];
-  const delimiter = '--' + boundary;
-
-  const forms: FormArg[] = [];
-  const warnings: string[] = [];
-  const segments = req.body.split(delimiter);
-
-  for (const seg of segments) {
-    // 去除首尾换行
-    let part = seg;
-    part = part.replace(/^\r?\n/, '');
-    part = part.replace(/\r?\n$/, '');
-    if (!part || part === '--') continue;
-
-    // 分离 part header 与 part body
-    let sep = part.indexOf('\r\n\r\n');
-    let sepLen = 4;
-    if (sep === -1) {
-      sep = part.indexOf('\n\n');
-      sepLen = 2;
-    }
-    if (sep === -1) {
-      // 无 header/body 空行：MIME 允许 boundary 前后存在应忽略的 preamble/epilogue；
-      // 但含 Content-Disposition 的是被截断的真实 part，静默跳过会丢数据，拒绝
-      if (/Content-Disposition:/i.test(part)) {
-        throw new ConvertWarning(
-          'multipart part looks truncated (Content-Disposition present but no blank line before its body); refusing to convert rather than silently dropping it. Check that the original request is complete.',
-        );
-      }
-      continue;
-    }
-
-    const partHeaders = part.slice(0, sep);
-    const partBody = part.slice(sep + sepLen);
-
-    const cdMatch = partHeaders.match(
-      /Content-Disposition:\s*form-data;[^\r\n]*/i,
-    );
-    if (!cdMatch) {
-      // 静默跳过会丢数据（原版 h2c 在此处同样报错），拒绝
-      throw new ConvertWarning(
-        'multipart part is missing its Content-Disposition header; refusing to convert rather than silently dropping it. Check that the original request is complete.',
-      );
-    }
-    const cd = cdMatch[0];
-    const nameMatch = cd.match(/name="([^"]*)"/i);
-    const fileMatch = cd.match(/filename="([^"]*)"/i);
-    const name = nameMatch ? nameMatch[1] : '';
-
-    // part 级 Content-Type 保留为 ;type=：否则 curl 按文件扩展名猜或退回
-    // application/octet-stream，改变 wire format。含参数值（如 "text/plain;
-    // charset=utf-8"）直接原样拼接即可，curl 会完整发送（实测验证，勿加引号）
-    const ctLine = partHeaders.split(/\r\n|\n/).find((l) => /^Content-Type:/i.test(l));
-    const partCT = ctLine?.replace(/^Content-Type:[ \t]*/i, '').replace(/[ \t]+$/, '');
-    const typeSuffix = partCT ? `;type=${partCT}` : '';
-
-    if (fileMatch) {
-      forms.push({ content: `${name}=@${fileMatch[1]}${typeSuffix}`, literal: false });
-    } else if (needsFormString(partBody)) {
-      // --form-string 整体字面发送（含 @ / ;type= 等文本），线上形态与原报文一致；
-      // 代价：它不解析任何指令，part 级 Content-Type 无法附带，需提醒
-      if (partCT) {
-        warnings.push(
-          `multipart field "${name}": its value would be misparsed by --form syntax (@/< prefix or ;type=/;filename=/;encoder=/;headers= inside the value); using --form-string to send it literally, which drops the part's Content-Type (${partCT})`,
-        );
-      }
-      forms.push({ content: `${name}=${partBody}`, literal: true });
-    } else {
-      forms.push({ content: `${name}=${partBody}${typeSuffix}`, literal: false });
-    }
-  }
-
-  if (forms.length === 0 && req.body.trim()) {
-    throw new ConvertWarning(
-      'failed to parse multipart body: boundary exists but no parts found. Check that the original request is complete.',
-    );
-  }
-
-  return { forms, warnings };
 }
 
 /** 转换警告：可恢复但应让用户知晓的问题（如 chunked 无法表达） */
@@ -425,6 +350,9 @@ export function convert(httpText: string, options: Options = {}): ConvertResult 
   if (!host && !absoluteForm) {
     throw new Error('missing Host header');
   }
+  if (host) {
+    validateAuthority(host);
+  }
   if (absoluteForm) {
     warnings.push('request line is absolute-form (contains a full URL); using that URL directly');
     let authority: string | undefined;
@@ -497,19 +425,33 @@ export function convert(httpText: string, options: Options = {}): ConvertResult 
 
   // chunked Transfer-Encoding 是流式语义，curl 命令行无法忠实表达：
   // 服务端可能依赖分块边界（如流式上传/大 body），且命令行长度受限。
-  // 解码后改用 --data-binary 会改变 wire format，故拒绝转换。
-  const te = getHeader(req.headers, 'transfer-encoding');
-  if (te && /\bchunked\b/i.test(te)) {
+  // 解码后改用 --data-raw 会改变 wire format，故拒绝转换。
+  // 必须检查全部同名头的全部值并按逗号 token 解析——只查第一条会被
+  // "TE: gzip" + "TE: chunked"（或单条 "TE: gzip, chunked"）绕过。
+  const teValues = getHeaderValues(req.headers, 'transfer-encoding');
+  const teTokens = teValues.flatMap((v) => v.split(',').map((t) => t.trim().toLowerCase()));
+  if (teTokens.includes('chunked')) {
     throw new ConvertWarning(
       'Transfer-Encoding: chunked cannot be converted to an equivalent curl command: streaming chunk semantics are lost on a command line, and decoding would change the wire format. Retry with a Content-Length body instead.',
     );
   }
+  // TE + CL 组合是请求走私特征：curl 会按 body 实际长度重算 CL，与原 TE 头同时出现在
+  // 线上，服务端取哪条不确定。无法忠实表达这类歧义，提醒用户。
+  if (teValues.length > 0 && clValues.length > 0) {
+    warnings.push(
+      'Transfer-Encoding and Content-Length are both present (a request smuggling signature); curl will send its own computed Content-Length alongside the Transfer-Encoding header(s)',
+    );
+  }
 
-  const multipart = isMultipart(req);
   // powershell 档用 curl.exe：Windows PowerShell 5.1 把裸 curl 别名到 Invoke-WebRequest，
   // 会把整条命令喂给错误的 cmdlet；curl.exe 在 Windows PowerShell 与 pwsh 下都直指真 curl。
   // （pwsh on Linux/macOS 无此别名，但该档位面向 Windows 用户。）
-  const args: string[] = [opts.shell === 'powershell' ? 'curl.exe' : 'curl'];
+  // --disable（-q）必须是第一个参数才生效：跳过 ~/.curlrc，防止用户本地配置注入
+  // proxy/header/认证等改变请求语义，保证生成的命令自包含、跨环境可复现。
+  const args: string[] = [
+    opts.shell === 'powershell' ? 'curl.exe' : 'curl',
+    '--disable',
+  ];
 
   const opt = (long: string, short: string): string => opts.shortOpt ? short : long;
 
@@ -528,8 +470,8 @@ export function convert(httpText: string, options: Options = {}): ConvertResult 
   }
 
   // 3. 方法
-  // HEAD / GET 带 body：--data-binary 会让 curl 自动把方法切成 POST，
-  // --head 与 --data-binary 更是直接互斥（curl 报错），必须显式 --request 保持方法。
+  // HEAD / GET 带 body：--data-raw 会让 curl 自动把方法切成 POST，
+  // --head 与 --data-raw 更是直接互斥（curl 报错），必须显式 --request 保持方法。
   // 这种形态非标准但可表达：照常生成 + warning。
   if (method === 'HEAD') {
     if (req.body) {
@@ -546,16 +488,21 @@ export function convert(httpText: string, options: Options = {}): ConvertResult 
       'GET request with a body (non-standard but expressible with curl); added --request GET to keep the method; some servers/proxies reject such requests',
     );
   } else if (method !== 'GET' && method !== 'POST') {
-    args.push(opt('--request', '-X'), method);
+    // method 保留原大小写（扩展 method 区分大小写）并无条件引用：合法 tchar 含
+    // & ' ` | 等 shell 元字符，裸输出会被 shell 二次解释（命令注入）。
+    args.push(opt('--request', '-X'), q(req.method));
   }
 
   // 重复头的处理原则：恰好一个 → 用专属选项（输出更可读）；
   // 出现重复 → 全部按原始顺序逐条透传为 -H，专属选项完全不用。
   // 原因：合并/拆分会改变 wire format，而服务端实现未必按 RFC 把同名头视作等价
   // （有的只取第一个，有的按原始行解析）；安全工具更是常故意构造重复头。
-  // 且 -H 同名头会抑制 curl 内部生成的头（如 -b 的 Cookie、-A 的 UA），混用会丢数据。
+  // 且 -H 同名头会抑制 curl 内部生成的头（如 -A 的 UA），混用会丢数据。
+  // Cookie 例外：不用 --cookie 专属选项——curl 对不含 = 的 --cookie 参数按文件名
+  // 解释（尝试读取该路径的 cookie 文件并把匹配域的 cookie 发出），是不必要的本地
+  // 文件读取与凭据风险；统一 -H 透传，wire format 也更精确。
   //
-  // OWS 处理原则：专属选项（-A / -b / -u / --compressed）由 curl 内部生成 header 行，
+  // OWS 处理原则：专属选项（-A / -u / --compressed）由 curl 内部生成 header 行，
   // 无法精确控制前导/后导空白；当 value 含非标准 OWS（多空格/HTAB/后导空格）时，
   // 改走 -H 原样透传以保持 wire format，并追加 warning 提醒用户。
 
@@ -572,18 +519,7 @@ export function convert(httpText: string, options: Options = {}): ConvertResult 
     }
   }
 
-  // 5. Cookie
-  const cookieValues = getHeaderValues(req.headers, 'cookie');
-  if (cookieValues.length === 1) {
-    const cookie = cookieValues[0];
-    if (isStandardOWS(cookie)) {
-      args.push(opt('--cookie', '-b'), q(stripStandardOWS(cookie)));
-    } else {
-      warnings.push(
-        'Cookie header has non-standard OWS (leading spaces/HTAB/trailing whitespace); passed through as -H to preserve the wire format',
-      );
-    }
-  }
+  // 5. Cookie：不转 --cookie（见上），统一按普通 header 透传，无需特殊处理
 
   // 6. Accept-Encoding: 含 gzip/deflate/br/zstd 任一 -> --compressed
   let encodingConsumed = false;
@@ -636,12 +572,11 @@ export function convert(httpText: string, options: Options = {}): ConvertResult 
   // host / content-length 由 curl 全权管理，一律跳过
   const alwaysSkip = new Set(['host', 'content-length']);
   // 已被专属选项消费的（恰好一个且 OWS 标准的特殊头）；非标准 OWS 或重复的会原样透传
+  // （multipart 的 Content-Type 不再消费：body 整体走 --data-raw，CT 头按普通头原样透传）
   const consumed = new Set<string>();
   if (uaValues.length === 1 && isStandardOWS(uaValues[0])) consumed.add('user-agent');
-  if (cookieValues.length === 1 && isStandardOWS(cookieValues[0])) consumed.add('cookie');
   if (encodingConsumed) consumed.add('accept-encoding');
   if (authConsumed) consumed.add('authorization');
-  if (multipart) consumed.add('content-type');
 
   // 默认头抑制
   if (!opts.allowDefaultHeaders) {
@@ -662,35 +597,38 @@ export function convert(httpText: string, options: Options = {}): ConvertResult 
   }
 
   // 9. 请求体
-  // --data-binary 会让 curl 注入默认头 Content-Type: application/x-www-form-urlencoded；
+  // 用 --data-raw 发送字面 body：与 --data-binary 逐字节等价（同样会让 curl 注入默认头
+  // Content-Type: application/x-www-form-urlencoded），但不解释 curl 的 @file 元语法——
+  // --data-binary 会让前导 @ 的 body（如 "@/etc/passwd"）变成读取本地文件并上传其内容，
+  // shell quote 阻止不了这一层（curl 的 argv DSL，不是 shell 语法）。
   // 原请求没有 Content-Type 时必须以 -H 'Content-Type:' 清空（与 Accept / User-Agent 的
   // 默认头抑制同一手法），否则线上字节被改变。
+  //
+  // multipart/form-data 不做特殊处理：body 同样整体走 --data-raw，Content-Type 头（含
+  // boundary）按普通头原样透传，线上字节与原报文完全一致。曾经的 --form 重构方案有两个
+  // 无法接受的问题：1) curl 会重新生成 boundary 并重建整个 body（从未 wire 等价，且手写
+  // MIME 解析会在 boundary 子串/缺失 closing delimiter 时静默截断或丢 part 头）；
+  // 2) 远端声明的 filename 会被映射成 name=@本地路径——curl 转而读取并上传本机文件，
+  // 而不是原始 body 里的字节（本地文件读取/外传路径）。字面 body 没有这两类问题。
   const hasContentType = getHeader(req.headers, 'content-type') !== undefined;
   const suppressDefaultCT = () => {
     if (!hasContentType) args.push(opt('--header', '-H'), q('Content-Type:'));
   };
   // 原始请求显式声明 Content-Length: 0（POST/PUT 无 body 时常见）：curl 默认一个 CL 头都
-  // 不发，与原报文不一致；--data-binary '' 让 curl 实际发送 Content-Length: 0。
-  // GET/HEAD 除外：--data-binary 会把方法切成 POST / 与 --head 互斥，得不偿失
+  // 不发，与原报文不一致；--data-raw '' 让 curl 实际发送 Content-Length: 0。
+  // GET/HEAD 除外：--data-raw 会把方法切成 POST / 与 --head 互斥，得不偿失
   // （GET/HEAD 声明 CL:0 极罕见，维持不注入空 body）。
   const declaredZeroBody = req.body === '' && method !== 'GET' && method !== 'HEAD' &&
     clValues.length > 0 &&
     clValues.every((v) => /^\d+$/.test(v.trim()) && Number(v.trim()) === 0);
-  if (multipart) {
-    const { forms, warnings: mpWarnings } = parseMultipart(req);
-    warnings.push(...mpWarnings);
-    for (const f of forms) {
-      // --form-string 没有短选项（-F 只对应 --form），字面 part 必须用长选项
-      args.push(f.literal ? '--form-string' : opt('--form', '-F'), q(f.content));
-    }
-  } else if (req.body) {
+  if (req.body) {
     suppressDefaultCT();
-    args.push('--data-binary', q(req.body));
+    args.push('--data-raw', q(req.body));
   } else if (declaredZeroBody) {
     suppressDefaultCT();
-    args.push('--data-binary', q(''));
+    args.push('--data-raw', q(''));
   } else if (method === 'POST') {
-    // POST 无 body 且未声明 CL:0：用 --request POST 明确方法，避免 --data-binary ''
+    // POST 无 body 且未声明 CL:0：用 --request POST 明确方法，避免 --data-raw ''
     // 注入原请求没有的 Content-Length: 0。
     // 注意：若前文已因非 GET/POST 方法追加过 --request，此处不会重复触发。
     args.push(opt('--request', '-X'), 'POST');
