@@ -214,6 +214,16 @@ main {
   pointer-events: none;
 }
 
+/* 键盘可达性：checkbox/radio 本体被视觉隐藏，focus 环画在外层 chip 上 */
+.chip:focus-within {
+  border-color: var(--coral);
+  box-shadow: 0 0 0 2px var(--coral-soft), 0 0 0 1px var(--coral);
+}
+
+.chip:focus-within:hover {
+  box-shadow: 0 0 0 2px var(--coral-soft);
+}
+
 .chip:has(input:checked) {
   color: var(--coral-deep);
   background: var(--coral-soft);
@@ -273,6 +283,11 @@ button:hover {
 
 button:active {
   transform: translateY(1px);
+}
+
+button:focus-visible {
+  outline: 2px solid var(--coral-deep);
+  outline-offset: 2px;
 }
 
 /* 错误/拒绝态下输出区是提示文案而非命令，禁用复制 */

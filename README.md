@@ -277,6 +277,26 @@ Therefore chunked requests are **refused**:
 
 Retry with a `Content-Length` body instead.
 
+### HTTP version and HTTP/2 (h2c) boundary
+
+h2c-modern only accepts **HTTP/1.x-style text messages**. Real HTTP/2 wire format (binary frames,
+HPACK, streams) is not representable on a curl command line in this form — HTTP/2 pseudo-header
+lines (`:method`, `:path`, ...) are refused explicitly. Note: despite the project name, "h2c"
+originally stood for _headers to curl_, not the h2c (HTTP/2 cleartext) protocol.
+
+The HTTP version is handled as follows:
+
+- **By default (`-i` off) the version is not pinned.** The generated command lets curl negotiate:
+  against an HTTPS endpoint, ALPN may select HTTP/2 even though the original message was HTTP/1.1.
+  The command reproduces the _message_ (method, target, headers, body) — not the protocol version of
+  the original connection. If version fidelity matters, turn on `-i` / HTTP version.
+- With `-i`, an `HTTP/1.0` / `HTTP/1.1` input pins `--http1.0` / `--http1.1` — the wire version is
+  then exact. An `HTTP/2` input emits `--http2`, which is only a **negotiation preference** (curl
+  still upgrades via ALPN on TLS), not a faithful reproduction of an HTTP/2 connection.
+- `--http2` on a cleartext (`http://`) URL is **not** h2c prior knowledge — curl would send HTTP/1.1
+  (or attempt an Upgrade). Reproducing a real h2c connection requires `--http2-prior-knowledge`,
+  which this tool does not emit.
+
 ### Binary bytes are refused
 
 Shell arguments cannot carry arbitrary bytes: non-UTF-8 sequences have already been replaced by

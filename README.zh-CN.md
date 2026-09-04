@@ -247,6 +247,23 @@ PowerShell 5.1 向原生程序传参会破坏此类参数，命令需 PowerShell
 
 建议改用 `Content-Length` 形式的请求体后重试。
 
+### HTTP 版本与 HTTP/2（h2c）支持边界
+
+h2c-modern 只接收 **HTTP/1.x 风格的文本报文**。真实的 HTTP/2 wire 格式（二进制帧、HPACK、stream）
+无法在这样一条 curl 命令行上表达——HTTP/2 伪头行（`:method`、`:path` 等）会被明确拒绝。注意：尽管
+项目名叫 h2c，这里原本指 _headers to curl_，并非 h2c（HTTP/2 cleartext）协议。
+
+HTTP 版本的处理方式：
+
+- **默认（不开 `-i`）不锁定协议版本。** 生成的命令让 curl 自行协商：对 HTTPS 端点，ALPN 可能 协商出
+  HTTP/2，即使原报文是 HTTP/1.1。命令复现的是**报文本身**（方法、target、header、body），
+  而不是原始连接的协议版本。需要版本保真时请开启 `-i` / HTTP version。
+- 开启 `-i` 后，`HTTP/1.0` / `HTTP/1.1` 输入会锁定 `--http1.0` / `--http1.1`——此时线上版本是精确
+  的。`HTTP/2` 输入输出 `--http2`，但这只是**协商偏好**（TLS 下 curl 仍走 ALPN 升级），并不是对
+  HTTP/2 连接的忠实复现。
+- 明文（`http://`）URL 下 `--http2` 也**不是** h2c prior knowledge——curl 仍会发 HTTP/1.1（或尝试
+  Upgrade）。复现真实的 h2c 连接需要 `--http2-prior-knowledge`，本工具不输出该选项。
+
 ### 二进制字节会被拒绝
 
 shell 参数无法承载任意字节：非 UTF-8 序列在粘贴/解码阶段已被替换为 U+FFFD， NUL 字节更是无法通过

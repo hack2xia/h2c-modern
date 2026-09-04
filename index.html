@@ -116,7 +116,13 @@ Host: example.com
       copy.disabled = !ok;
     }
 
-    input.addEventListener('input', update);
+    // 大报文逐键同步转换会阻塞主线程：输入走 150ms 防抖；选项切换仍即时更新
+    let pendingUpdate = 0;
+    function scheduleUpdate() {
+      clearTimeout(pendingUpdate);
+      pendingUpdate = setTimeout(update, 150);
+    }
+    input.addEventListener('input', scheduleUpdate);
     document
       .querySelectorAll('.controls input')
       .forEach((el) => el.addEventListener('change', update));
