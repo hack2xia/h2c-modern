@@ -16,6 +16,8 @@ jobs:
       - run: deno fmt --check
       - run: deno lint
       - run: deno task test
+      # 构建冒烟：web bundle（esbuild）与 cli 编译两条产物路径都要保持可用
+      - run: deno task build
 
   # 构建镜像并起容器做冒烟测试：页面、静态资源、esbuild 产物可访问，
   # 以及 .mjs 的 MIME 类型是 javascript（Dockerfile 对 nginx mime.types 的

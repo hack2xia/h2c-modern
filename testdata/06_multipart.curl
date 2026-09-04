@@ -1,4 +1,4 @@
-curl --disable --header 'User-Agent:' --header 'Accept:' --header 'Content-Type: multipart/form-data; boundary=----WebKitFormBoundary' --data-raw '------WebKitFormBoundary
+curl --disable --header 'User-Agent:' --header 'Accept:' --header 'Host: example.com' --header 'Content-Type: multipart/form-data; boundary=----WebKitFormBoundary' --data-raw '------WebKitFormBoundary
 Content-Disposition: form-data; name="name"
 
 moo

@@ -2,17 +2,16 @@
 // 对比线上字节与原始报文——防止"生成正确"与"发送正确"脱节
 // （如 --data-raw 触发 curl 注入默认 Content-Type，这类问题只有回放能暴露）。
 //
-// 归一化（双方同规则应用，不弱化断言）：
-// - 行尾 LF → CRLF（夹具为 LF 文本，curl 恒发 CRLF；body 内部换行同样归一化）
+// 严格 oracle：夹具为 CRLF 字节（见 .gitattributes），header 区不做排序、
+// 不删除 Content-Length / Accept-Encoding 行——header 顺序、CL 值与位置、
+// AE 值全部逐字节参与比对（converter 以 -H 原位透传它们，wire 应与输入一致）。
+// 仅保留三类归一化（双方同规则应用，不弱化断言）：
 // - Host 值（回放指向 127.0.0.1 随机端口）
-// - Accept-Encoding 值（--compressed 由 curl 按构建生成编码列表，属文档化的有损映射）
-// - Content-Length 行整体剔除：本工具把 CL 交给 curl 按实际 body 重算（原报文有/无、
-//   值对/错都会被替换），body 字节一致性已单独校验，足以覆盖长度错误
 // - HTTP 版本 token（版本保真由 -i 选项管辖，回放不启用；04 夹具请求行为 HTTP/2）
 // - Expect 头（curl 对较大 body 自动附加 Expect: 100-continue，是传输层提示，
 //   与请求语义无关；服务器端已回 100 让 body 正常发出）
 // multipart 夹具无需特殊比对：body 经 --data-raw 整体字面发送（含原始 boundary 与
-// 全部 part 头），Content-Type 头原样透传，走与普通请求相同的归一化比对即可。
+// 全部 part 头），Content-Type 头原样透传，走与普通请求相同的比对。
 import { assert, assertEquals } from 'jsr:@std/assert@^1.0.19';
 import { convert } from './convert.ts';
 
@@ -20,7 +19,9 @@ const testdataUrl = new URL('./testdata/', import.meta.url);
 const enc = new TextEncoder();
 const dec = new TextDecoder();
 
-/** 解析本项目 shQuote 风格（单引号包裹、'\'' 转义）的命令行为参数数组 */
+/** 解析本项目 shQuote 风格（单引号包裹、'\'' 转义）的命令行为参数数组。
+ * 注意空 argv：`--data-raw ''` 的第二个参数是空串，必须保留（不能因 cur 为空就丢弃）。
+ */
 function shSplit(s: string): string[] {
   const out: string[] = [];
   let cur = '';
@@ -29,8 +30,11 @@ function shSplit(s: string): string[] {
     const c = s[i];
     if (c === "'") {
       i++;
+      const start = i;
       while (i < s.length && s[i] !== "'") cur += s[i++];
       i++; // 闭合引号
+      // 独立的空引号对 ''（且无相邻拼接内容）表示一个空 argv
+      if (i - start === 0 && cur === '') out.push('');
     } else if (c === '\\' && s[i + 1] === "'") {
       cur += "'";
       i += 2;
@@ -104,11 +108,14 @@ async function readFullRequest(conn: Deno.Conn): Promise<Uint8Array> {
   return concatBytes(chunks);
 }
 
-/** 归一化：行尾 CRLF、Host / Accept-Encoding 值占位、CL / Expect 行剔除、HTTP 版本占位；
- * header 行排序后比对 */
-function normalizeWire(bytes: Uint8Array): string {
-  let text = dec.decode(bytes);
-  text = text.replace(/\r?\n/g, '\r\n');
+/** 归一化：Host 值占位、Expect 行剔除、HTTP 版本占位。
+ * header 保持原始顺序逐行比对（不排序）。
+ * dropComputedCl：原始报文没有 Content-Length 时，curl 必须自行计算并注入一条
+ * （body 分帧必需，无法抑制）——此时剔除 CL 行；原始报文有 CL 时逐字比对
+ * （converter 以 -H 原位透传，wire 的 CL 值与位置都应与输入一致）。
+ * 两侧用同一 dropComputedCl 规则，不会掩盖 CL 存在时的差异。 */
+function normalizeWire(bytes: Uint8Array, dropComputedCl: boolean): string {
+  const text = dec.decode(bytes);
   const sep = text.indexOf('\r\n\r\n');
   const head = sep === -1 ? text : text.slice(0, sep);
   const body = sep === -1 ? '' : text.slice(sep + 4);
@@ -116,13 +123,9 @@ function normalizeWire(bytes: Uint8Array): string {
   const requestLine = lines[0].replace(/HTTP\/[\w.]+$/, 'HTTP/NORM');
   const headers = lines.slice(1)
     .filter((l) => l.trim() !== '')
-    .filter((l) => !/^Content-Length:/i.test(l)) // curl 恒按实际 body 重算，见文件头注释
     .filter((l) => !/^Expect:/i.test(l)) // curl 对较大 body 自动附加，传输层提示，见文件头注释
-    .map((l) =>
-      l.replace(/^Host:.*$/i, 'Host: NORM')
-        .replace(/^Accept-Encoding:.*$/i, 'Accept-Encoding: NORM')
-    )
-    .sort();
+    .filter((l) => !(dropComputedCl && /^Content-Length:/i.test(l)))
+    .map((l) => l.replace(/^Host:.*$/i, 'Host: NORM'));
   return [requestLine, ...headers, '', body].join('\r\n');
 }
 
@@ -191,7 +194,13 @@ Deno.test('replay: 夹具生成的命令实际发送的字节与原始报文一�
       const received = receivedQueue.shift();
       if (received === undefined) throw new Error(`${name}: 回显服务器未收到请求`);
 
-      assertEquals(normalizeWire(received), normalizeWire(enc.encode(raw)), name);
+      // 原始报文没有 CL 头时，curl 必须自行计算注入一条（无法抑制）；有 CL 时逐字比对
+      const dropComputedCl = !/^Content-Length:/im.test(raw);
+      assertEquals(
+        normalizeWire(received, dropComputedCl),
+        normalizeWire(enc.encode(raw), dropComputedCl),
+        name,
+      );
     }
   } finally {
     listener.close();

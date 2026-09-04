@@ -1,2 +1,1 @@
-curl --disable --header 'User-Agent:' --header 'Accept:' --header 'Content-Type: application/x-www-form-urlencoded' --data-raw 'user=alice&pass=secret
-' 'https://example.com/login'
+curl --disable --header 'User-Agent:' --header 'Accept:' --header 'Host: example.com' --header 'Content-Type: application/x-www-form-urlencoded' --header 'Content-Length: 22' --data-raw 'user=alice&pass=secret' 'https://example.com/login'

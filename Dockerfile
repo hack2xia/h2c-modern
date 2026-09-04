@@ -3,12 +3,16 @@
 FROM denoland/deno:2.9.5 AS builder
 
 WORKDIR /app
+
+# 先只拷贝依赖清单并预拉取 esbuild：convert.ts 变动时这一层缓存仍可复用，
+# 依赖安装不会每次构建都重新执行
+COPY deno.json deno.lock ./
+RUN deno cache --frozen npm:esbuild@0.24.0
+
 COPY convert.ts .
 
-# 预拉取 esbuild，并把核心模块打包成 ESM
-RUN deno cache npm:esbuild@0.24.0 \
- && mkdir -p _build \
- && deno run --allow-read --allow-write --allow-env --allow-run \
+# 把核心模块打包成 ESM
+RUN deno run --allow-read --allow-write --allow-env --allow-run \
       npm:esbuild@0.24.0 convert.ts --bundle --format=esm \
       --outfile=_build/convert.mjs
 

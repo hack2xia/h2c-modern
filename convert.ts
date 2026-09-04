@@ -6,7 +6,7 @@ export type ShellTarget = 'sh' | 'powershell';
 
 /** 转换选项 */
 export interface Options {
-  /** 使用短选项（-H / -A / -u / -I / -X / -v），默认 false */
+  /** 使用短选项（-H / -I / -X / -v / -g），默认 false */
   shortOpt?: boolean;
   /** 追加 --verbose，默认 false */
   verbose?: boolean;
@@ -94,8 +94,34 @@ function parse(input: string): ParseResult {
     }
   }
 
-  const requestLine = lines[0].trim();
-  const parts = requestLine.split(/\s+/);
+  // 请求行按单个 SP 切分：curl 重建的请求行恒为 "METHOD SP target [SP HTTP/x]"，
+  // 输入中的前后空白、连续 SP/HTAB 无法忠实表达（静默折叠会改变线上字节），属明显错误。
+  // HTAB 分隔会落入 method 的 token 校验。
+  // 混合行尾：部分行 CRLF、部分行裸 LF，说明报文在复制/传输中被损坏过，且无法
+  // 还原原始字节边界。纯 LF 不提示——真实请求在线上恒为 CRLF，从终端/文本工具复制
+  // 出的 LF 文本是正常形态，curl 统一以 CRLF 发送即可。
+  {
+    const crlf = (headerSection.match(/\r\n/g) ?? []).length;
+    const lf = (headerSection.match(/\n/g) ?? []).length;
+    if (crlf > 0 && lf > crlf) {
+      warnings.push(
+        'header section has mixed line endings (both CRLF and bare LF) — the message was likely corrupted in transit; curl will send CRLF throughout',
+      );
+    }
+  }
+
+  const requestLine = lines[0];
+  if (requestLine !== requestLine.trim()) {
+    throw new Error(
+      `invalid request line (leading/trailing whitespace): "${requestLine}"`,
+    );
+  }
+  const parts = requestLine.split(' ');
+  if (parts.some((p) => p === '')) {
+    throw new Error(
+      `invalid request line (multiple/missing spaces): "${requestLine}"`,
+    );
+  }
   // 请求行必须是 "METHOD target [HTTP/x]" 两到三段：
   // 多于三段通常是 URL 含未编码空格，静默截断会丢数据，属明显错误
   if (
@@ -369,7 +395,11 @@ export function convert(httpText: string, options: Options = {}): ConvertResult 
     validateAuthority(host);
   }
   if (absoluteForm) {
-    warnings.push('request line is absolute-form (contains a full URL); using that URL directly');
+    // curl 直连时把 URL 拆成 origin-form 请求行（实测），不会发送 absolute-form 的
+    // 请求行形态——该差异无法用 curl 表达，提醒用户。Host 头原样以 -H 透传。
+    warnings.push(
+      'request line is absolute-form (contains a full URL); using that URL directly (note: curl sends an origin-form request-target on the wire, not the absolute-form)',
+    );
     let authority: string | undefined;
     try {
       authority = new URL(req.path).host;
@@ -378,41 +408,47 @@ export function convert(httpText: string, options: Options = {}): ConvertResult 
     }
     if (host && host !== authority) {
       warnings.push(
-        `absolute-form URL authority (${authority}) does not match the Host header (${host}); using the URL from the request line`,
+        `absolute-form URL authority (${authority}) does not match the Host header (${host}); connecting to the URL authority while preserving the original Host header via -H`,
       );
     }
   }
 
-  // Content-Length：curl 会自动计算，一律跳过；但重复头需要甄别
+  // Content-Length：curl 默认按 body 实际长度重算并注入 CL。实测（curl 8.x wire 捕获）：
+  // -H 'Content-Length: n' 会替换 curl 内部计算的 CL 且不重复（无论值与 body 是否一致），
+  // 重复的相同 CL 也会逐条发送。因此数值合法的 CL 一律按原始位置以 -H 原样透传——
+  // 线上字节与原报文一致（包括声明值与实际 body 不一致的走私形态报文）；
+  // 值不同的重复 CL 是请求走私特征，curl 无法忠实表达，拒绝；
+  // 非数值的 CL 无法透传，退回由 curl 重算并提醒。
   const clValues = getHeaderValues(req.headers, 'content-length');
+  let clPassthrough = false;
   if (clValues.length > 1) {
     if (new Set(clValues).size === 1) {
-      warnings.push(
-        'multiple identical Content-Length headers; ignored (curl computes it automatically)',
-      );
+      // 值相同的重复 CL：curl 会逐条发送 -H 形式的 CL，可忠实表达
+      clPassthrough = true;
     } else {
-      // 值不一致的重复 CL 是请求走私特征，curl 无法忠实表达
       throw new ConvertWarning(
         'multiple Content-Length headers with different values (an HTTP request smuggling signature); a curl command cannot express this faithfully. Refusing to convert.',
       );
     }
   }
-  // 单个 Content-Length：与 body 实际字节数比对。
-  // 不一致时 curl 会按实际长度重算、静默改变线上字节，属"可能有问题"，应提醒；
-  // 声明长度大于实际时，多半是粘贴/日志截断，提示更明确。
-  if (clValues.length === 1) {
-    const cl = clValues[0].trim();
-    if (!/^\d+$/.test(cl)) {
+  if (clValues.length > 0) {
+    if (!clValues.every((v) => /^\d+$/.test(v.trim()))) {
       warnings.push(
-        `Content-Length value "${cl}" is not a valid number; ignored (curl computes it from the actual body)`,
+        `Content-Length value "${
+          clValues.find((v) => !/^\d+$/.test(v.trim()))
+        }" is not a valid number; ignored (curl computes it from the actual body)`,
       );
     } else {
+      clPassthrough = true;
+      // 与 body 实际字节数比对（多字节字符按 UTF-8 字节计）。
+      // 透传声明值意味着线上字节与原报文一致——包括其不一致本身；
+      // 这里仅提醒，帮助用户发现粘贴截断/粘贴换行等非预期输入。
+      const declared = Number(clValues[0].trim());
       const actual = new TextEncoder().encode(req.body).length;
-      const declared = Number(cl);
       if (declared !== actual) {
         if (actual < declared) {
           warnings.push(
-            `Content-Length declares ${declared} bytes but the body is only ${actual} bytes — the body may be truncated; check the original request (curl will send the actual length)`,
+            `Content-Length declares ${declared} bytes but the body is only ${actual} bytes — the command sends the declared length and the body verbatim, reproducing the original (possibly truncated) message; check the original request`,
           );
         } else {
           // 多出的字节恰好是一段结尾换行：大概率是粘贴文本自带的末尾换行，专门提示
@@ -420,17 +456,15 @@ export function convert(httpText: string, options: Options = {}): ConvertResult 
           let trailing = 0;
           if (req.body.endsWith('\r\n')) trailing = 2;
           else if (req.body.endsWith('\n')) trailing = 1;
-          if (
-            trailing > 0 && declared === actual - trailing
-          ) {
+          if (trailing > 0 && declared === actual - trailing) {
             warnings.push(
               `Content-Length declares ${declared} bytes but the body is ${actual} bytes; the extra ${
                 trailing === 1 ? 'byte is a trailing LF' : 'bytes are a trailing CRLF'
-              } — likely just the final newline of the pasted input. curl will send it as part of the body; delete the trailing newline if that is not intended`,
+              } — likely just the final newline of the pasted input. The command reproduces the pasted bytes (server will see the excess as a new request); delete the trailing newline if that is not intended`,
             );
           } else {
             warnings.push(
-              `Content-Length declares ${declared} bytes but the body is ${actual} bytes — inconsistent; curl will send the actual length`,
+              `Content-Length declares ${declared} bytes but the body is ${actual} bytes — inconsistent; the command sends the declared length and the full body verbatim (reproducing the original message bytes)`,
             );
           }
         }
@@ -508,94 +542,22 @@ export function convert(httpText: string, options: Options = {}): ConvertResult 
     args.push(opt('--request', '-X'), q(req.method));
   }
 
-  // 重复头的处理原则：恰好一个 → 用专属选项（输出更可读）；
-  // 出现重复 → 全部按原始顺序逐条透传为 -H，专属选项完全不用。
-  // 原因：合并/拆分会改变 wire format，而服务端实现未必按 RFC 把同名头视作等价
-  // （有的只取第一个，有的按原始行解析）；安全工具更是常故意构造重复头。
-  // 且 -H 同名头会抑制 curl 内部生成的头（如 -A 的 UA），混用会丢数据。
-  // Cookie 例外：不用 --cookie 专属选项——curl 对不含 = 的 --cookie 参数按文件名
-  // 解释（尝试读取该路径的 cookie 文件并把匹配域的 cookie 发出），是不必要的本地
-  // 文件读取与凭据风险；统一 -H 透传，wire format 也更精确。
+  // 4. 请求头：全部按原始顺序以 -H 原样透传（包括 Host / Content-Length /
+  // User-Agent / Accept-Encoding / Authorization）。
   //
-  // OWS 处理原则：专属选项（-A / -u / --compressed）由 curl 内部生成 header 行，
-  // 无法精确控制前导/后导空白；当 value 含非标准 OWS（多空格/HTAB/后导空格）时，
-  // 改走 -H 原样透传以保持 wire format，并追加 warning 提醒用户。
+  // 为什么不用专属选项（-A / -u / --compressed）：curl 的专属选项由内部生成 header 行，
+  // 无法精确控制值与前导/后导空白，且专属参数先输出会把原始头顺序整体重排（改变线上
+  // 字节）。实测（curl 8.x wire 捕获）-H 形式的同名头按 argv 位置替换 curl 内部默认头
+  // （Host / User-Agent / Accept / Content-Length / Content-Type），不产生重复——因此
+  // -H 是唯一能同时保住"头的值、空白形态与原始顺序"的表达方式。
+  // Cookie 同理不用 --cookie：curl 对不含 = 的 --cookie 参数按文件名解释（尝试读取该
+  // 路径的 cookie 文件并把匹配域的 cookie 发出），是本地文件读取与凭据风险。
+  // Content-Length 是否透传由前文 clPassthrough 决定（非数值时退回 curl 重算）。
 
-  // 4. User-Agent
-  const uaValues = getHeaderValues(req.headers, 'user-agent');
-  if (uaValues.length === 1) {
-    const ua = uaValues[0];
-    if (isStandardOWS(ua)) {
-      args.push(opt('--user-agent', '-A'), q(stripStandardOWS(ua)));
-    } else {
-      warnings.push(
-        'User-Agent header has non-standard OWS (leading spaces/HTAB/trailing whitespace); passed through as -H to preserve the wire format',
-      );
-    }
-  }
-
-  // 5. Cookie：不转 --cookie（见上），统一按普通 header 透传，无需特殊处理
-
-  // 6. Accept-Encoding: 含 gzip/deflate/br/zstd 任一 -> --compressed
-  let encodingConsumed = false;
-  const aeValues = getHeaderValues(req.headers, 'accept-encoding');
-  if (aeValues.length === 1) {
-    const ae = aeValues[0];
-    if (isStandardOWS(ae) && /(gzip|deflate|br|zstd)/i.test(ae)) {
-      args.push('--compressed');
-      encodingConsumed = true;
-    } else if (!isStandardOWS(ae)) {
-      warnings.push(
-        'Accept-Encoding header has non-standard OWS; passed through as -H (not using --compressed, to preserve the wire format)',
-      );
-    }
-  }
-
-  // 7. Basic 认证（仅 Basic 转 --user；Bearer/Digest 等保留为普通 header）
-  let authConsumed = false;
-  const auth = getHeaderValues(req.headers, 'authorization');
-  if (auth.length === 1) {
-    const av = auth[0];
-    if (isStandardOWS(av)) {
-      const stripped = stripStandardOWS(av);
-      if (/^basic\s+/i.test(stripped)) {
-        const encoded = stripped.replace(/^basic\s+/i, '').trim();
-        try {
-          const decoded = atob(encoded);
-          if ([...decoded].some((c) => c.charCodeAt(0) > 0x7f)) {
-            // 解码后超出 user:password 常规字符范围：RFC 7617 未规定编码，
-            // 猜编码重编码会改变 wire format，故原样透传 Authorization 头并提醒
-            warnings.push(
-              'Basic credentials decode to non-ASCII bytes; passing the Authorization header through verbatim (not guessing an encoding) — please verify',
-            );
-          } else {
-            args.push(opt('--user', '-u'), q(decoded));
-            authConsumed = true;
-          }
-        } catch {
-          // base64 解码失败，作为普通 header 处理
-        }
-      }
-    } else {
-      warnings.push(
-        'Authorization header has non-standard OWS; passed through as -H to preserve the wire format',
-      );
-    }
-  }
-
-  // 8. 请求头
-  // host / content-length 由 curl 全权管理，一律跳过
-  const alwaysSkip = new Set(['host', 'content-length']);
-  // 已被专属选项消费的（恰好一个且 OWS 标准的特殊头）；非标准 OWS 或重复的会原样透传
-  // （multipart 的 Content-Type 不再消费：body 整体走 --data-raw，CT 头按普通头原样透传）
-  const consumed = new Set<string>();
-  if (uaValues.length === 1 && isStandardOWS(uaValues[0])) consumed.add('user-agent');
-  if (encodingConsumed) consumed.add('accept-encoding');
-  if (authConsumed) consumed.add('authorization');
-
-  // 默认头抑制（合成的空头恒用 colon 形式——正是利用 curl "空值即删除" 的语义来清默认值）
+  // 默认头抑制（合成的空头恒用 colon 形式——正是利用 curl "空值即删除" 的语义来清默认值；
+  // 原始输入里有 UA / Accept 时，header 循环里的 -H 会替换 curl 默认值，无需抑制）
   if (!opts.allowDefaultHeaders) {
-    if (uaValues.length === 0) {
+    if (getHeader(req.headers, 'user-agent') === undefined) {
       args.push(opt('--header', '-H'), q('User-Agent:'));
     }
     if (getHeader(req.headers, 'accept') === undefined) {
@@ -605,7 +567,7 @@ export function convert(httpText: string, options: Options = {}): ConvertResult 
 
   for (const h of req.headers) {
     const key = h.name.toLowerCase();
-    if (alwaysSkip.has(key) || consumed.has(key)) continue;
+    if (key === 'content-length' && !clPassthrough) continue;
     // 空值 header（原始行 "Name:"）：-H 'Name:' 会被 curl 当作"删除/抑制该头"而非发送，
     // 与合成抑制头同语义会静默丢头。curl 的分号形式 -H 'Name;' 才会在线上发出 "Name:"
     // （8.x 实测逐字节一致），空值头一律用它。
@@ -645,23 +607,13 @@ export function convert(httpText: string, options: Options = {}): ConvertResult 
   const suppressDefaultCT = () => {
     if (!hasContentType) args.push(opt('--header', '-H'), q('Content-Type:'));
   };
-  // 原始请求显式声明 Content-Length: 0（POST/PUT 无 body 时常见）：curl 默认一个 CL 头都
-  // 不发，与原报文不一致；--data-raw '' 让 curl 实际发送 Content-Length: 0。
-  // GET/HEAD 除外：--data-raw 会把方法切成 POST / 与 --head 互斥，得不偿失
-  // （GET/HEAD 声明 CL:0 极罕见，维持不注入空 body）。
-  const declaredZeroBody = req.body === '' && method !== 'GET' && method !== 'HEAD' &&
-    clValues.length > 0 &&
-    clValues.every((v) => /^\d+$/.test(v.trim()) && Number(v.trim()) === 0);
   if (req.body) {
     suppressDefaultCT();
     args.push('--data-raw', q(req.body));
-  } else if (declaredZeroBody) {
-    suppressDefaultCT();
-    args.push('--data-raw', q(''));
   } else if (method === 'POST') {
-    // POST 无 body 且未声明 CL:0：用 --request POST 明确方法，避免 --data-raw ''
-    // 注入原请求没有的 Content-Length: 0。
-    // 注意：若前文已因非 GET/POST 方法追加过 --request，此处不会重复触发。
+    // POST 无 body（无论是否声明 CL:0）：用 --request POST 保持方法（没有 --data-raw
+    // 时 curl 默认发 GET）。声明的 CL:0 已由 header 循环以 -H 透传（实测无 body 时
+    // -H 'Content-Length: 0' 同样上线，且不会注入 Content-Type）。
     args.push(opt('--request', '-X'), 'POST');
   }
 

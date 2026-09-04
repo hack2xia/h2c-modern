@@ -1,1 +1,1 @@
-curl --disable --request 'PUT' --user 'alice:secret' --header 'User-Agent:' --header 'Accept:' --header 'Content-Type: application/json' --data-raw '{"x":1}' 'https://api.example.com/items/1'
+curl --disable --request 'PUT' --header 'User-Agent:' --header 'Accept:' --header 'Host: api.example.com' --header 'Content-Type: application/json' --header 'Authorization: Basic YWxpY2U6c2VjcmV0' --data-raw '{"x":1}' 'https://api.example.com/items/1'

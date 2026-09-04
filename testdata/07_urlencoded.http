@@ -1,6 +1,6 @@
 POST /login HTTP/1.1
 Host: example.com
 Content-Type: application/x-www-form-urlencoded
-Content-Length: 23
+Content-Length: 22
 
 user=alice&pass=secret

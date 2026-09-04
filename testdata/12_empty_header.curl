@@ -1,1 +1,1 @@
-curl --disable --header 'User-Agent:' --header 'Accept:' --header 'X-Empty;' --header 'X-Normal: v' 'https://example.com/'
+curl --disable --header 'User-Agent:' --header 'Accept:' --header 'Host: example.com' --header 'X-Empty;' --header 'X-Normal: v' 'https://example.com/'

@@ -1,1 +1,1 @@
-curl --disable --compressed --header 'User-Agent:' --header 'Accept:' --header 'Cookie: sid=abc; theme=dark' 'https://example.com/data'
+curl --disable --header 'User-Agent:' --header 'Accept:' --header 'Host: example.com' --header 'Cookie: sid=abc; theme=dark' --header 'Accept-Encoding: gzip' 'https://example.com/data'

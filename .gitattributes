@@ -1,0 +1,4 @@
+# 夹具是真实 HTTP wire 形态（CRLF 字节），必须逐字节保留：
+# 行尾被 git 规范化会破坏 replay 测试的严格字节比对
+testdata/*.http -text
+testdata/*.curl -text

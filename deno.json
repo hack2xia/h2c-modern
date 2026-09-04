@@ -3,10 +3,10 @@
   "version": "0.4.1",
   "exports": "./convert.ts",
   "tasks": {
-    "test": "deno test --allow-read --allow-net=127.0.0.1 --allow-run=curl --allow-write",
+    "test": "deno test --frozen --allow-read --allow-net=127.0.0.1 --allow-run=curl,deno --allow-write",
     "fmt": "deno fmt",
     "lint": "deno lint",
-    "build:web": "deno run --allow-read --allow-write --allow-env --allow-run npm:esbuild@0.24.0 convert.ts --bundle --format=esm --outfile=_build/convert.mjs",
+    "build:web": "deno run --frozen --allow-read --allow-write --allow-env --allow-run npm:esbuild@0.24.0 convert.ts --bundle --format=esm --outfile=_build/convert.mjs",
     "build:cli": "deno compile --allow-read --output _build/h2c cli.ts",
     "build": "deno task build:web && deno task build:cli",
     "serve": "deno run --allow-net --allow-read jsr:@std/http@1.1.3/file-server . --port 4507 --host 127.0.0.1"
