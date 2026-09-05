@@ -176,9 +176,10 @@ CR（CR 仅可 作为 CRLF 的组成部分，属请求走私向量）、缺 `Hos
 `Host`、`Host` 不是合法 authority（含 userinfo `@` / 路径 / 查询 / fragment 字符、端口越界或非
 数字、IPv6 未 bracket 包裹——这类值拼进 URL 后会被 URL parser 重新解释，造成目标主机混淆）、
 值不同的重复 `Content-Length`（请求走私特征）、`Transfer-Encoding: chunked`（检查全部同名头的全部
-逗号 token，`TE: gzip` + `TE: chunked` 或单条 `TE: gzip, chunked` 同样拒绝）、输入任意位置含 NUL
-字节（shell argv 无法承载 NUL）或二进制/非 UTF-8 字节（U+FFFD 替换字符，请求行 / header / body
-任一位置）、`CONNECT`（代理隧道控制报文）。
+逗号 token，`TE: gzip` + `TE: chunked` 或单条 `TE: gzip, chunked` 同样拒绝）、`Transfer-Encoding` 与
+`Content-Length` 同时存在（请求走私特征——curl 会按 body 重算 CL 并与 TE 头同时发出，产生
+原报文没有的分帧）、输入任意位置含 NUL 字节（shell argv 无法承载 NUL）或二进制/非 UTF-8 字节（U+FFFD
+替换字符，请求行 / header / body 任一位置）、`CONNECT`（代理隧道控制报文）。
 
 **生成 + warning（warning）**：混合行尾（部分 CRLF、部分裸 LF——多半在复制/传输中被损坏过，curl
 会统一以 CRLF 发送；纯 LF 是从终端/文本工具粘贴的正常形态，**不**提示）、absolute-form 请求行
@@ -190,13 +191,12 @@ CR（CR 仅可 作为 CRLF 的组成部分，属请求走私向量）、缺 `Hos
 字节数不一致（声明值原样透传，线上字节与原报文完全一致——包括不一致本身；声明大于实际时提示请求体
 可能被截断；多出的字节恰好是一段结尾 LF/CRLF 时，warning 会明确提示这很可能只是粘贴文本的末尾
 换行）、`Content-Length` 值非数字（无法透传，curl 自动按 body 计算）、`-i` 遇到未识别的 HTTP 版本
-（不输出 flag）、URL 含非 ASCII 字符（按 UTF-8 百分号编码）、`Transfer-Encoding` 与 `Content-Length`
-同时存在（请求走私特征；curl 会按实际 body 重算 CL 并与 TE 头同时发出）、`GET` / `HEAD` 带
-body（curl 的 `--data-raw` 会把方法切成 POST、 `--head` 与 body 互斥，故追加 `--request GET` /
-`--request HEAD` 保持方法，部分服务器/代理会拒绝）、 URL 路径/查询含 `{}` / `[]`（curl
-默认把这类字符当 glob 展开：`{a,b}` 会发多个请求、`[abc]` 直接报错；追加 `--globoff`
-按字面发送，不做百分号编码，保持 wire format 不变）、PowerShell 方言下参数值含双引号（Windows
-PowerShell 5.1 向原生程序传参会破坏此类参数，命令需 PowerShell 7.3+）。
+（不输出 flag）、URL 含非 ASCII 字符（按 UTF-8 百分号编码）、`GET` / `HEAD` 带 body（curl 的
+`--data-raw` 会把方法切成 POST、 `--head` 与 body 互斥，故追加 `--request GET` / `--request HEAD`
+保持方法，部分服务器/代理会拒绝）、 URL 路径/查询含 `{}` / `[]`（curl 默认把这类字符当 glob
+展开：`{a,b}` 会发多个请求、`[abc]` 直接报错；追加 `--globoff` 按字面发送，不做百分号编码，保持 wire
+format 不变）、PowerShell 方言下参数值含双引号（Windows PowerShell 5.1
+向原生程序传参会破坏此类参数，命令需 PowerShell 7.3+）。
 
 ### 请求头处理（wire 实测）
 

@@ -189,9 +189,11 @@ the header section (CR is only valid as part of CRLF — a request smuggling vec
 values would be reinterpreted by the URL parser once concatenated into the URL, causing target host
 confusion); duplicate `Content-Length` with different values (an HTTP request smuggling signature);
 `Transfer-Encoding: chunked` (all same-name headers and comma tokens are checked — `TE: gzip` +
-`TE: chunked` or a single `TE: gzip, chunked` is refused as well); NUL bytes anywhere in the input
-(shell arguments cannot carry NUL); binary / non-UTF-8 bytes anywhere in the input (U+FFFD
-replacement characters); `CONNECT` (proxy tunnel control message).
+`TE: chunked` or a single `TE: gzip, chunked` is refused as well); `Transfer-Encoding` combined with
+`Content-Length` (a request smuggling signature — curl would send its computed CL alongside the TE
+headers, producing a framing the original message never had); NUL bytes anywhere in the input (shell
+arguments cannot carry NUL); binary / non-UTF-8 bytes anywhere in the input (U+FFFD replacement
+characters); `CONNECT` (proxy tunnel control message).
 
 **warning** (questionable but generated): mixed line endings (part CRLF, part bare LF — likely
 corrupted in transit; curl sends CRLF throughout; pure LF input is a normal paste form and is
@@ -207,15 +209,14 @@ is passed through verbatim, reproducing the original bytes including the mismatc
 suggests a truncated body, and when the excess is exactly a trailing LF/CRLF the warning calls out
 the likely paste artifact); non-numeric `Content-Length` (cannot be passed through; curl computes
 from the body); unrecognized HTTP version with `-i` (no version flag emitted); non-ASCII URL
-characters (percent-encoded as UTF-8); `Transfer-Encoding` and `Content-Length` both present (a
-request smuggling signature; curl sends its computed CL alongside the TE headers); `GET` / `HEAD`
-with a body (curl's `--data-raw` would switch the method to POST, and `--head` conflicts with a
-body, so `--request GET` / `--request HEAD` is added to keep the method — some servers/proxies
-reject such requests); `{}` / `[]` in the URL path/query (curl treats these as glob metacharacters
-by default: `{a,b}` sends multiple requests and `[abc]` errors out; `--globoff` is appended to send
-them literally, without percent-encoding, keeping the wire format unchanged); argument values
-containing double quotes under the PowerShell dialect (Windows PowerShell 5.1 mangles such arguments
-when invoking native executables; the command requires PowerShell 7.3+).
+characters (percent-encoded as UTF-8); `GET` / `HEAD` with a body (curl's `--data-raw` would switch
+the method to POST, and `--head` conflicts with a body, so `--request GET` / `--request HEAD` is
+added to keep the method — some servers/proxies reject such requests); `{}` / `[]` in the URL
+path/query (curl treats these as glob metacharacters by default: `{a,b}` sends multiple requests and
+`[abc]` errors out; `--globoff` is appended to send them literally, without percent-encoding,
+keeping the wire format unchanged); argument values containing double quotes under the PowerShell
+dialect (Windows PowerShell 5.1 mangles such arguments when invoking native executables; the command
+requires PowerShell 7.3+).
 
 ### Header handling (wire-verified)
 

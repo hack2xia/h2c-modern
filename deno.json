@@ -1,6 +1,6 @@
 {
   "name": "h2c-modern",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "exports": "./convert.ts",
   "tasks": {
     "test": "deno test --frozen --allow-read --allow-net=127.0.0.1 --allow-run=curl,deno --allow-write",

@@ -1255,12 +1255,24 @@ Deno.test('chunked: 单条 TE 内逗号 token 的 chunked 也能拒绝', () => {
   );
 });
 
-Deno.test('chunked: TE + CL 组合提醒请求走私特征', () => {
-  const result = convert(
-    'POST / HTTP/1.1\nHost: x.example\nTransfer-Encoding: gzip\nContent-Length: 5\n\nhello',
+Deno.test('chunked: TE + CL 组合拒绝（走私特征，curl 会重算 CL 改变分帧）', () => {
+  assertThrows(
+    () =>
+      convert(
+        'POST / HTTP/1.1\nHost: x.example\nTransfer-Encoding: gzip\nContent-Length: 5\n\nhello',
+      ),
+    ConvertWarning,
+    'smuggling',
   );
-  assertEquals(result.warnings.length, 1);
-  assert(result.warnings[0].includes('smuggling'));
+  // 非数值 CL 与 TE 并存同样拒绝：framing 歧义与数值合法性无关
+  assertThrows(
+    () =>
+      convert(
+        'POST / HTTP/1.1\nHost: x.example\nTransfer-Encoding: gzip\nContent-Length: abc\n\nhello',
+      ),
+    ConvertWarning,
+    'smuggling',
+  );
 });
 
 // ===== 安全回归：--disable 为第一个 curl 参数（M2）=====

@@ -485,10 +485,10 @@ export function convert(httpText: string, options: Options = {}): ConvertResult 
     );
   }
   // TE + CL 组合是请求走私特征：curl 会按 body 实际长度重算 CL，与原 TE 头同时出现在
-  // 线上，服务端取哪条不确定。无法忠实表达这类歧义，提醒用户。
+  // 线上，服务端取哪条不确定——线上分帧与原报文必然不同，无法忠实表达，拒绝转换。
   if (teValues.length > 0 && clValues.length > 0) {
-    warnings.push(
-      'Transfer-Encoding and Content-Length are both present (a request smuggling signature); curl will send its own computed Content-Length alongside the Transfer-Encoding header(s)',
+    throw new ConvertWarning(
+      'Transfer-Encoding and Content-Length are both present (a request smuggling signature): curl would send its own computed Content-Length alongside the TE headers, producing a framing the original message never had. Refusing to convert.',
     );
   }
 
